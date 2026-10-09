@@ -4,9 +4,11 @@ const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;'
 const hue = s => [...String(s)].reduce((a, c) => a + c.charCodeAt(0) * 31, 7) % 360;
 const RTC = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 
-const S = { id: '', nick: '', party: '', invite: [], cur: null, voice: null, mic: null, share: null, q: null, muted: false, deaf: false };
+const S = { id: '', nick: '', party: '', invite: [], cur: null, voice: null, mic: null, share: null, shareAudio: null, q: null, muted: false, deaf: false };
 const peers = new Map(), convs = new Map(), speaking = new Set(), watchers = new Map();
-let ws, ac, mode = 'join', hosting = false;
+let ws, ac, mode = 'join', hosting = false, lastConnection = null;
+let historyTimer = null;
+const U = { state: 'idle', version: '', progress: null };
 
 // Conversas: 'text' / 'voice' (canais da party), 'group' (grupo) e 'dm' (individual).
 const nickOf = id => (id === S.id ? S.nick : peers.get(id)?.nick || '?');
@@ -19,6 +21,38 @@ const tell = (ids, m) => ids.forEach(i => { const d = peers.get(i)?.dc; if (d?.r
 const sig = (to, data) => ws.send(JSON.stringify({ t: 'signal', to, data }));
 const vstate = () => ({ t: 'voice', c: S.voice, m: S.muted || S.deaf, s: !!S.share });
 const announce = () => tell([...peers.keys()], vstate());
+
+function historySnapshot() {
+  return [...convs.values()].map(c => ({
+    id: c.id, type: c.type, name: c.name, peer: c.peer, members: c.members,
+    msgs: c.msgs.map(m => ({ n: m.n, text: m.text, ts: m.ts })),
+  }));
+}
+function persistHistory() {
+  if (!hosting) return;
+  clearTimeout(historyTimer);
+  historyTimer = setTimeout(() => bridge.persistence.saveHistory(historySnapshot()).catch(() => {}), 500);
+}
+function restoreHistory(history) {
+  (history || []).forEach(c => ensure({ ...c, msgs: Array.isArray(c.msgs) ? c.msgs : [], unread: 0 }));
+}
+let recentParties = [];
+function renderRecentParties(parties) {
+  recentParties = parties || [];
+  const section = $('#recent-parties'), list = $('#recent-list');
+  section.hidden = !recentParties.length;
+  list.innerHTML = recentParties.map((party, index) => `<button type="button" class="recent-party" data-recent="${index}">
+    <b>${esc(party.name)}</b><small>${esc(party.nick)} · ${esc(party.address)}</small><span>Entrar</span>
+  </button>`).join('');
+}
+function joinRecent(index) {
+  const party = recentParties[index]; if (!party) return;
+  $('#nick').value = party.nick || $('#nick').value;
+  $('#addr').value = party.address;
+  $('#pass').value = party.password || '';
+  selectMode('join');
+  $('#lf').requestSubmit();
+}
 const QUAL = [
   { label: '720p, 30 fps', w: 1280, h: 720, fps: 30, bps: 2.5e6 },
   { label: '1080p, 30 fps', w: 1920, h: 1080, fps: 30, bps: 5e6 },
@@ -27,6 +61,7 @@ const QUAL = [
 
 // ───────── Conexão com o host (só sinalização) ─────────
 function connect(addr, nick, password) {
+  lastConnection = { address: addr, nick, password };
   ws = new WebSocket('ws://' + (addr.includes(':') ? addr : addr + ':7777'));
   ws.onopen = () => ws.send(JSON.stringify({ t: 'join', nick, password }));
   ws.onerror = () => fail('Não foi possível conectar ao host. Confira o endereço, a porta e o firewall.');
@@ -36,6 +71,7 @@ function connect(addr, nick, password) {
     if (m.t === 'error') fail(m.msg);
     else if (m.t === 'welcome') {
       S.id = m.id; S.party = m.party;
+      if (!hosting && lastConnection) bridge.persistence.saveRecent({ name: S.party, ...lastConnection }).catch(() => {});
       m.channels.forEach(ensure);
       m.members.forEach(x => addPeer(x.id, x.nick, true)); // quem chega liga para quem já está
       enter(); open(m.channels[0].id);
@@ -62,12 +98,14 @@ function addPeer(id, nick, init) {
   pc.onconnectionstatechange = () => { p.state = pc.connectionState; render(); };
   pc.ontrack = e => {
     if (e.track.kind === 'video') { p.vstream = new MediaStream([e.track]); return; }
-    p.el = new Audio(); p.el.srcObject = new MediaStream([e.track]);
-    p.el.play().catch(() => {}); watch(id, p.el.srcObject); apply();
+    p.astream ||= new MediaStream(); p.astream.addTrack(e.track);
+    p.el ||= new Audio(); p.el.srcObject = p.astream;
+    p.el.play().catch(() => {}); watch(id, p.astream); apply();
   };
   if (init) {
     bind(p, pc.createDataChannel('d'));
     p.tx = pc.addTransceiver('audio', { direction: 'sendrecv' }); // o microfone entra depois, via replaceTrack
+    p.stx = pc.addTransceiver('audio', { direction: 'sendrecv' }); // áudio da transmissão de tela
     p.vx = pc.addTransceiver('video', { direction: 'sendrecv' }); // a tela entra depois, via replaceTrack
     pc.setLocalDescription().then(() => sig(id, { sdp: pc.localDescription }));
   }
@@ -81,8 +119,10 @@ async function onSig(from, d) {
     await pc.setRemoteDescription(d.sdp);
     for (const c of p.pend.splice(0)) pc.addIceCandidate(c).catch(() => {});
     if (d.sdp.type === 'offer') {
-      p.tx = pc.getTransceivers().find(t => t.receiver.track.kind === 'audio');
+      const audio = pc.getTransceivers().filter(t => t.receiver.track.kind === 'audio');
+      [p.tx, p.stx] = audio;
       p.tx.direction = 'sendrecv';
+      p.stx.direction = 'sendrecv';
       p.vx = pc.getTransceivers().find(t => t.receiver.track.kind === 'video');
       p.vx.direction = 'sendrecv';
       await pc.setLocalDescription();
@@ -112,11 +152,12 @@ function handle(p, m) {
     const c = m.c === 'dm' ? dmConv(p.id) : convs.get(m.c);
     if (!c || c.type === 'dm' && m.c !== 'dm' || c.type === 'group' && !c.members.includes(p.id)) return;
     c.msgs.push({ n: p.nick, text: String(m.text).slice(0, 2000), ts: Date.now() });
+    persistHistory();
     if (S.cur !== c.id) c.unread++;
     render();
   } else if (m.t === 'group') {
     if (String(m.id).startsWith('g-') && m.members?.includes(S.id) && m.members.includes(p.id))
-      { ensure({ id: m.id, type: 'group', name: String(m.name).slice(0, 30), members: m.members }); render(); }
+      { ensure({ id: m.id, type: 'group', name: String(m.name).slice(0, 30), members: m.members }); persistHistory(); render(); }
   } else if (m.t === 'watch') {
     p.watching = !!m.on; apply();
   } else if (m.t === 'voice') {
@@ -136,6 +177,7 @@ function apply() {
   peers.forEach(p => {
     const together = !!S.voice && p.voice === S.voice;
     p.tx?.sender.replaceTrack(together ? S.mic : null).catch(() => {});
+    p.stx?.sender.replaceTrack(together && p.watching ? S.shareAudio : null).catch(() => {});
     if (p.el) p.el.muted = !together || S.deaf;
     if (p.watch && !(together && p.sharing)) p.watch = false;
     setVideo(p, S.share && together && p.watching ? S.share : null); // a tela só vai para quem clicou em Assistir
@@ -175,8 +217,8 @@ function leaveVoice() {
 }
 
 // ───────── Compartilhamento de tela ─────────
-// Cada par já tem uma faixa de vídeo negociada. A tela só é enviada a quem pediu para assistir,
-// porque cada espectador custa uma cópia do vídeo no upload de quem transmite.
+// Cada par já tem uma faixa de vídeo e outra de áudio da transmissão negociadas. Elas só são
+// enviadas a quem pediu para assistir, porque cada espectador custa uma cópia no upload.
 async function pickScreen() {
   let list;
   try { list = await bridge.sources(); } catch { return toast('Não foi possível listar as telas.'); }
@@ -185,23 +227,25 @@ async function pickScreen() {
   d.innerHTML = `<form method="dialog"><h3>Compartilhar tela</h3>
     <div class="srcs">${list.map((s, i) => `<label class="src"><input type="radio" name="s" value="${esc(s.id)}"${i ? '' : ' checked'}><img src="${s.thumb}" alt=""><span>${esc(s.name)}</span></label>`).join('')}</div>
     <label>Qualidade <select name="q">${QUAL.map((q, i) => `<option value="${i}">${q.label}</option>`).join('')}</select></label>
+    <label class="ck"><input type="checkbox" name="audio" checked> Compartilhar áudio do sistema</label>
     <p class="dim">Cada pessoa que assistir usa essa banda do seu upload.</p>
     <menu><button value="ok" class="go">Transmitir</button><button value="x" formnovalidate>Cancelar</button></menu></form>`;
   d.returnValue = '';
   d.onclose = () => {
     const r = d.querySelector('[name=s]:checked');
-    if (d.returnValue === 'ok' && r) startShare(r.value, QUAL[d.querySelector('[name=q]').value]);
+    if (d.returnValue === 'ok' && r) startShare(r.value, QUAL[d.querySelector('[name=q]').value], d.querySelector('[name=audio]').checked);
   };
   d.showModal();
 }
 
-async function startShare(id, q) {
+async function startShare(id, q, withAudio) {
   try {
-    await bridge.pick(id);
+    await bridge.pick({ id, audio: withAudio });
     const st = await navigator.mediaDevices.getDisplayMedia({
-      video: { width: { ideal: q.w, max: q.w }, height: { ideal: q.h, max: q.h }, frameRate: { ideal: q.fps, max: q.fps } }, audio: false,
+      video: { width: { ideal: q.w, max: q.w }, height: { ideal: q.h, max: q.h }, frameRate: { ideal: q.fps, max: q.fps } },
+      audio: withAudio,
     });
-    S.share = st.getVideoTracks()[0]; S.q = q;
+    S.share = st.getVideoTracks()[0]; S.shareAudio = st.getAudioTracks()[0] || null; S.q = q;
     S.share.contentHint = q.fps > 30 ? 'motion' : 'detail';
     S.share.onended = stopShare; // quando a janela some ou o Windows interrompe a captura
   } catch { return toast('Não foi possível iniciar a transmissão.'); }
@@ -211,6 +255,7 @@ async function startShare(id, q) {
 function stopShare() {
   if (!S.share) return;
   S.share.onended = null; S.share.stop(); S.share = null;
+  S.shareAudio?.stop(); S.shareAudio = null;
   peers.forEach(p => (p.watching = false));
   announce(); apply(); render();
 }
@@ -238,11 +283,11 @@ function renderStage() {
     if (!p.watch || !p.vstream) return tiles.push(tile(`<div class="ph"><b>${esc(p.nick)}</b> está transmitindo<button class="go" data-watch="${p.id}">Assistir</button></div>`));
     if (!p.vel) {
       p.vel = Object.assign(document.createElement('video'), { autoplay: true, muted: true });
-      p.vel.ondblclick = () => p.vel.requestFullscreen();
+      p.vel.ondblclick = () => fullScreen(p);
     }
     p.vel.srcObject = p.vstream;
     const t = tile(`<span class="tl">${esc(p.nick)}</span><div class="tb"><button data-full="${p.id}">Tela cheia</button><button data-unwatch="${p.id}">Parar de assistir</button></div>`);
-    t.prepend(p.vel); tiles.push(t); p.vel.play().catch(() => {});
+    p.tile = t; t.prepend(p.vel); tiles.push(t); p.vel.play().catch(() => {});
   });
   st.replaceChildren(...tiles); st.hidden = !tiles.length;
 }
@@ -272,6 +317,7 @@ function say(text) {
   if (!c || !text) return;
   const ts = Date.now();
   c.msgs.push({ n: S.nick, text, ts });
+  persistHistory();
   tell(others(c), { t: 'msg', c: c.type === 'dm' ? 'dm' : c.id, text });
   render();
 }
@@ -290,15 +336,16 @@ function ask(kind) {
     const members = [S.id, ...[...d.querySelectorAll('[type=checkbox]:checked')].map(x => x.value)];
     const id = 'g-' + Math.random().toString(36).slice(2, 8);
     ensure({ id, type: 'group', name: n, members });
+    persistHistory();
     tell(members.filter(i => i !== S.id), { t: 'group', id, name: n, members });
     open(id);
   };
   d.showModal();
 }
 
-function toast(text, yes) {
+function toast(text, yes, yesLabel = 'Atender') {
   const d = document.createElement('div'); d.className = 'toast';
-  d.innerHTML = `<span>${esc(text)}</span>${yes ? '<button class="go">Atender</button>' : ''}<button>✕</button>`;
+  d.innerHTML = `<span>${esc(text)}</span>${yes ? `<button class="go">${esc(yesLabel)}</button>` : ''}<button>✕</button>`;
   d.querySelector('.go')?.addEventListener('click', () => { yes(); d.remove(); });
   d.querySelector('button:last-child').onclick = () => d.remove();
   setTimeout(() => d.remove(), yes ? 25000 : 8000);
@@ -309,10 +356,83 @@ function toast(text, yes) {
 function enter() {
   $('#login').hidden = true; $('#app').hidden = false;
   $('#me').dataset.u = S.id;
-  $('#ph').innerHTML = `<b>${esc(S.party)}</b><button id="leave" title="Sair da party">Sair</button>` +
+  $('#ph').innerHTML = `<b>${esc(S.party)}</b><button id="settings" title="Configurações">⚙</button><button id="leave" title="Sair da party">Sair</button>` +
     (hosting ? `<small id="inv" title="${esc(S.invite.join('  ·  '))}">Endereço p/ convidar: ${esc(S.invite[0] || 'sem rede')} (clique para copiar)</small>` : '');
   $('#leave').onclick = () => bridge.stop().finally(() => location.reload());
   if (hosting) $('#inv').onclick = () => { navigator.clipboard.writeText(S.invite[0] || ''); toast('Endereço copiado.'); };
+  $('#settings').onclick = openSettings;
+}
+
+function renderUpdateSettings() {
+  const button = $('#settings-update'), detail = $('#settings-update-detail');
+  const progress = $('#settings-update-progress'), meter = $('#settings-update-meter'), label = $('#settings-update-percent');
+  if (!button || !detail) return;
+  const labels = {
+    idle: 'Verificar atualizações', checking: 'Verificando…', available: `Baixar v${U.version}`,
+    downloading: 'Baixando…', downloaded: `Instalar v${U.version}`, installing: 'Reiniciando…',
+  };
+  const details = {
+    idle: U.message || 'Consulte a versão mais recente publicada no GitHub.',
+    checking: 'Consultando a release mais recente…',
+    available: `A versão ${U.version} está disponível para download.`,
+    downloading: U.progress?.total ? `Baixando a atualização: ${U.progress.percent}% concluído.` : 'Baixando a atualização…',
+    downloaded: `A versão ${U.version} foi baixada e está pronta para instalar.`,
+    installing: 'Encerrando a versão atual, substituindo o executável e abrindo a nova versão…',
+  };
+  button.textContent = labels[U.state] || 'Verificar atualizações';
+  button.disabled = U.state === 'checking' || U.state === 'downloading' || U.state === 'installing';
+  detail.textContent = details[U.state] || U.message || 'Não foi possível verificar atualizações.';
+  if (progress && meter && label) {
+    progress.hidden = U.state !== 'downloading';
+    meter.value = U.progress?.percent || 0;
+    label.textContent = U.progress?.total ? `${U.progress.percent}%` : 'Preparando download…';
+  }
+}
+
+function openSettings() {
+  const d = $('#dlg');
+  d.className = '';
+  d.innerHTML = `<form method="dialog"><h3>Configurações</h3>
+    <section class="setting"><b>Atualizações</b><p id="settings-update-detail" class="dim"></p><div id="settings-update-progress" class="update-progress" hidden><progress id="settings-update-meter" max="100" value="0"></progress><span id="settings-update-percent"></span></div><button type="button" id="settings-update"></button></section>
+    <menu><button value="ok" class="go">Fechar</button></menu></form>`;
+  d.querySelector('#settings-update').onclick = updateApp;
+  d.showModal();
+  renderUpdateSettings();
+  if (U.state === 'idle') checkForUpdate();
+}
+
+async function checkForUpdate() {
+  U.state = 'checking'; U.message = ''; renderUpdateSettings();
+  const result = await bridge.update.check();
+  if (result.status === 'available') {
+    U.state = 'available'; U.version = result.version;
+  } else {
+    U.state = 'idle'; U.message = result.status === 'current'
+      ? 'Você já está na versão mais recente.'
+      : result.message || 'Não foi possível verificar atualizações.';
+  }
+  renderUpdateSettings();
+}
+
+async function updateApp() {
+  if (U.state === 'idle') return checkForUpdate();
+  if (U.state === 'available') {
+    U.state = 'downloading'; U.progress = { percent: 0, total: 0 }; renderUpdateSettings();
+    const result = await bridge.update.download();
+    if (result.status === 'downloaded') {
+      U.state = 'downloaded'; U.version = result.version; U.progress = null;
+    } else { U.state = 'available'; U.progress = null; U.message = result.message || 'Não foi possível baixar a atualização.'; }
+    renderUpdateSettings();
+  } else if (U.state === 'downloaded') {
+    U.state = 'installing'; renderUpdateSettings();
+    const result = await bridge.update.install();
+    if (result.status !== 'installing') { U.state = 'downloaded'; U.message = result.message || 'Não foi possível instalar a atualização.'; renderUpdateSettings(); }
+  }
+}
+
+function fullScreen(peer) {
+  const target = peer?.tile || peer?.vel;
+  target?.requestFullscreen().catch(() => peer?.vel?.requestFullscreen().catch(() => {}));
 }
 
 function render() {
@@ -354,27 +474,29 @@ function render() {
 }
 
 // ───────── Eventos ─────────
-document.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => {
-  mode = b.dataset.tab;
-  document.querySelectorAll('[data-tab]').forEach(x => x.classList.toggle('on', x === b));
+function selectMode(next) {
+  mode = next;
+  document.querySelectorAll('[data-tab]').forEach(x => x.classList.toggle('on', x.dataset.tab === mode));
   const host = mode === 'host';
   $('#addr').hidden = host; $('#addr').required = !host;
   $('#pname').hidden = !host; $('#pname').required = host; $('#port').hidden = !host;
-  $('#go').textContent = host ? 'Criar e entrar' : 'Entrar';
-});
+  $('#go').textContent = host ? 'Abrir party' : 'Entrar';
+}
+document.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => selectMode(b.dataset.tab));
 
 $('#lf').onsubmit = async e => {
   e.preventDefault();
   ac ||= new AudioContext(); ac.resume();
   $('#err').textContent = ''; $('#go').disabled = true;
   S.nick = $('#nick').value.trim();
+  bridge.persistence.saveProfile({ nick: S.nick }).catch(() => {});
   const pass = $('#pass').value;
   let addr = $('#addr').value.trim();
   if (mode === 'host') {
     const port = Number($('#port').value) || 7777;
     const r = await bridge.start({ port, name: $('#pname').value.trim(), password: pass });
     if (!r.ok) { $('#go').disabled = false; return ($('#err').textContent = r.error); }
-    hosting = true; S.invite = r.ips.map(i => `${i.ip}:${port}`); addr = '127.0.0.1:' + port;
+    hosting = true; restoreHistory(r.history); S.invite = r.ips.map(i => `${i.ip}:${port}`); addr = '127.0.0.1:' + port;
   }
   connect(addr, S.nick, pass);
 };
@@ -398,10 +520,33 @@ $('#stage').onclick = e => {
   const d = b.dataset;
   if (d.watch) watchOn(d.watch, true);
   else if (d.unwatch) watchOn(d.unwatch, false);
-  else if (d.full) peers.get(d.full)?.vel?.requestFullscreen();
+  else if (d.full) fullScreen(peers.get(d.full));
   else if ('unshare' in d) stopShare();
 };
 $('#bm').onclick = () => { S.muted = !S.muted; announce(); apply(); render(); };
 $('#bd').onclick = () => { S.deaf = !S.deaf; announce(); apply(); render(); };
 $('#bl').onclick = leaveVoice;
 $('#txt').onkeydown = e => { if (e.key === 'Enter') { say(e.target.value); e.target.value = ''; } };
+$('#login-settings').onclick = openSettings;
+bridge.update.onProgress(progress => {
+  if (U.state === 'downloading') { U.progress = progress; renderUpdateSettings(); }
+});
+$('#recent-list').onclick = e => {
+  const button = e.target.closest('[data-recent]');
+  if (button) joinRecent(Number(button.dataset.recent));
+};
+
+async function restoreLocalParty() {
+  try {
+    const saved = await bridge.persistence.load();
+    $('#nick').value = saved.profile?.nick || '';
+    renderRecentParties(saved.recent);
+    if (!saved.party) return;
+    $('#pname').value = saved.party.name || '';
+    $('#port').value = saved.party.port || 7777;
+    $('#pass').value = saved.party.password || '';
+    selectMode('host');
+    $('#go').textContent = 'Abrir party salva';
+  } catch {}
+}
+restoreLocalParty();

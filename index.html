@@ -21,7 +21,13 @@
       <input id="port" type="number" value="7777" min="1024" max="65535" hidden>
       <input id="pass" type="password" placeholder="Senha da party">
       <button class="go" id="go">Entrar</button>
+      <button type="button" id="login-settings">Configurações</button>
+      <button type="button" id="login-update">Verificar atualizações</button>
       <p id="err"></p>
+      <section id="recent-parties" hidden>
+        <h2>Parties recentes</h2>
+        <div id="recent-list"></div>
+      </section>
     </form>
   </section>
 

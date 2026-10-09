@@ -4,14 +4,15 @@ const crypto = require('crypto');
 // Sinalização da party: autentica com a senha, apresenta os membros uns aos
 // outros e guarda a lista de canais. Voz e mensagens NUNCA passam por aqui:
 // vão direto entre os peers via WebRTC.
-function startServer({ port, name, password }) {
+function startServer({ port, name, password, channels: savedChannels, onChannelsChange }) {
   return new Promise((resolve, reject) => {
     const wss = new WebSocketServer({ port });
     const peers = new Map();
-    const channels = [
+    const defaults = [
       { id: 'c-geral', type: 'text', name: 'geral' },
       { id: 'c-voz', type: 'voice', name: 'Sala de voz' },
     ];
+    const channels = savedChannels?.length ? savedChannels.map(ch => ({ ...ch })) : defaults;
     const send = (ws, m) => ws.readyState === 1 && ws.send(JSON.stringify(m));
     const all = (m, except) => peers.forEach((p, id) => id !== except && send(p.ws, m));
 
@@ -35,7 +36,7 @@ function startServer({ port, name, password }) {
           send(peers.get(m.to).ws, { t: 'signal', from: id, data: m.data });
         } else if (m.t === 'channel-add' && ['text', 'voice'].includes(m.type)) {
           const ch = { id: 'c-' + crypto.randomBytes(3).toString('hex'), type: m.type, name: String(m.name).slice(0, 30) };
-          channels.push(ch);
+          channels.push(ch); onChannelsChange?.(channels);
           all({ t: 'channel-add', ch });
         }
       });
