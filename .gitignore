@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Build artifacts (electron-builder)
+dist/
+
+# Runtime logs and diagnostic reports
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
+
+# Environment files and local credentials
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Electron user data and crash reports
+crash-reports/
+
+# Editor and operating-system files
+.vscode/
+.idea/
+*.suo
+*.user
+*.sln.docstates
+.DS_Store
+Thumbs.db
+Desktop.ini

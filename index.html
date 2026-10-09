@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src ws:; media-src 'self' blob: mediastream:; img-src 'self' data:">
+  <title>Party P2P</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <section id="login">
+    <form id="lf">
+      <h1>Party P2P</h1>
+      <p class="dim">Voz e chat direto entre os membros, sem servidor de mídia no meio.</p>
+      <div class="tabs">
+        <button type="button" data-tab="join" class="on">Entrar numa party</button>
+        <button type="button" data-tab="host">Criar party</button>
+      </div>
+      <input id="nick" placeholder="Seu apelido" maxlength="24" required>
+      <input id="addr" placeholder="Endereço do host (ex.: 26.10.4.2:7777)" required>
+      <input id="pname" placeholder="Nome da party" maxlength="30" hidden>
+      <input id="port" type="number" value="7777" min="1024" max="65535" hidden>
+      <input id="pass" type="password" placeholder="Senha da party">
+      <button class="go" id="go">Entrar</button>
+      <p id="err"></p>
+    </form>
+  </section>
+
+  <main id="app" hidden>
+    <nav>
+      <header id="ph"></header>
+      <div id="side"></div>
+      <footer id="me">
+        <i id="av"></i><span id="mn"></span>
+        <button id="bm" title="Mutar microfone">🎙</button>
+        <button id="bd" title="Ensurdecer">🎧</button>
+        <button id="bl" class="bad" title="Sair da voz" hidden>☎</button>
+      </footer>
+    </nav>
+    <section id="chat">
+      <header id="head"></header>
+      <div id="stage" hidden></div>
+      <div id="msgs"></div>
+      <input id="txt" autocomplete="off" maxlength="2000">
+    </section>
+  </main>
+
+  <div id="toasts"></div>
+  <dialog id="dlg"></dialog>
+  <script src="renderer.js"></script>
+</body>
+</html>
