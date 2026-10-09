@@ -3,14 +3,14 @@ const fs = require('fs');
 const path = require('path');
 
 let state = null;
-const emptyState = () => ({ profile: { nick: '' }, party: null, history: [], recent: [] });
+const emptyState = () => ({ profile: { nick: '', avatar: '' }, party: null, history: [], recent: [] });
 const file = () => path.join(app.getPath('userData'), 'party-p2p.json');
 
 function load() {
   if (state) return state;
   try {
     const parsed = JSON.parse(fs.readFileSync(file(), 'utf8'));
-    state = { ...emptyState(), ...parsed };
+    state = { ...emptyState(), ...parsed, profile: { ...emptyState().profile, ...(parsed.profile || {}) } };
   } catch { state = emptyState(); }
   return state;
 }
@@ -38,7 +38,11 @@ function publicParty() {
 function cleanChannels(channels) {
   return Array.isArray(channels) ? channels
     .filter(ch => ['text', 'voice'].includes(ch?.type))
-    .map(ch => ({ id: String(ch.id).slice(0, 40), type: ch.type, name: String(ch.name).slice(0, 30) }))
+    .map(ch => ({
+      id: String(ch.id).slice(0, 40), type: ch.type, name: String(ch.name).slice(0, 30),
+      restricted: !!ch.restricted,
+      access: Array.isArray(ch.access) ? [...new Set(ch.access.map(key => String(key).slice(0, 80)).filter(Boolean))] : [],
+    }))
     .filter(ch => ch.id && ch.name) : [];
 }
 
@@ -55,18 +59,42 @@ function cleanHistory(history) {
   })).filter(conv => conv.id) : [];
 }
 
-function beginParty({ name, port, password }) {
+function cleanMembers(members) {
+  return Array.isArray(members) ? members.slice(-500).map(member => ({
+    key: String(member?.key || '').slice(0, 80),
+    nick: String(member?.nick || '').trim().replace(/\s+/g, ' ').slice(0, 24),
+    banned: !!member?.banned,
+    role: member?.role === 'admin' ? 'admin' : 'member',
+    firstSeen: Number(member?.firstSeen) || Date.now(),
+    lastSeen: Number(member?.lastSeen) || Date.now(),
+  })).filter(member => member.key && member.nick) : [];
+}
+
+function cleanOwnerDevice(value) {
+  const device = String(value || '').trim();
+  return /^[a-z0-9_-]{8,100}$/i.test(device) ? device : '';
+}
+
+function beginParty({ name, port, password, ownerDevice }) {
   const saved = load();
   const continuing = !!saved.party && saved.party.name === name && saved.party.port === port && reveal(saved.party.password) === password;
+  const savedOwner = continuing ? cleanOwnerDevice(saved.party.ownerDevice) : '';
   if (!continuing) saved.history = [];
   saved.party = {
     name: String(name).slice(0, 30),
     port: Number(port),
     password: protect(password),
+    ownerDevice: savedOwner || cleanOwnerDevice(ownerDevice),
     channels: continuing ? cleanChannels(saved.party.channels) : [],
+    members: continuing ? cleanMembers(saved.party.members) : [],
   };
   save();
-  return { channels: saved.party.channels, history: continuing ? cleanHistory(saved.history) : [] };
+  return {
+    channels: saved.party.channels,
+    members: saved.party.members,
+    ownerDevice: saved.party.ownerDevice,
+    history: continuing ? cleanHistory(saved.history) : [],
+  };
 }
 
 function saveChannels(channels) {
@@ -75,8 +103,19 @@ function saveChannels(channels) {
   save();
 }
 
+function saveMembers(members) {
+  if (!load().party) return;
+  state.party.members = cleanMembers(members);
+  save();
+}
+
 function saveProfile(profile) {
-  load().profile = { nick: String(profile?.nick || '').slice(0, 24) };
+  load().profile = { ...load().profile, nick: String(profile?.nick || '').slice(0, 24) };
+  save();
+}
+
+function saveAvatar(name) {
+  load().profile = { ...load().profile, avatar: String(name || '') };
   save();
 }
 
@@ -117,4 +156,4 @@ function snapshot() {
   return { profile: { ...load().profile }, party: publicParty(), recent: publicRecent() };
 }
 
-module.exports = { beginParty, publicParty, saveChannels, saveHistory, saveProfile, saveRecent, snapshot };
+module.exports = { beginParty, publicParty, saveChannels, saveMembers, saveHistory, saveProfile, saveAvatar, saveRecent, snapshot };

@@ -1,10 +1,93 @@
-const { app, BrowserWindow, ipcMain, session, desktopCapturer } = require('electron');
+const { app, BrowserWindow, ipcMain, session, desktopCapturer, dialog } = require('electron');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const https = require('https');
 const os = require('os');
 const path = require('path');
 const { startServer } = require('./server');
+
+// Mantém o mesmo armazenamento no `electron .` e no executável empacotado.
+const USER_DATA_NAME = 'Party P2P';
+const STATE_FILE = 'party-p2p.json';
+function readState(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch { return null; }
+}
+function uniqueBy(items, key) {
+  const map = new Map();
+  items.filter(Boolean).forEach(item => map.set(key(item), item));
+  return [...map.values()];
+}
+function mergeConversations(older, newer) {
+  const conversations = new Map();
+  for (const conversation of [...(Array.isArray(older) ? older : []), ...(Array.isArray(newer) ? newer : [])]) {
+    if (!conversation?.id) continue;
+    const current = conversations.get(conversation.id);
+    if (!current) { conversations.set(conversation.id, { ...conversation, msgs: [...(conversation.msgs || [])] }); continue; }
+    const messages = uniqueBy([...(current.msgs || []), ...(conversation.msgs || [])], message =>
+      `${message.ts || ''}\u0000${message.n || ''}\u0000${message.text || ''}`)
+      .sort((a, b) => (a.ts || 0) - (b.ts || 0));
+    conversations.set(conversation.id, {
+      ...current, ...conversation,
+      members: conversation.members?.length ? conversation.members : current.members,
+      msgs: messages,
+    });
+  }
+  return [...conversations.values()];
+}
+function mergeMembers(older, newer) {
+  const members = new Map();
+  for (const member of [...(Array.isArray(older) ? older : []), ...(Array.isArray(newer) ? newer : [])]) {
+    if (!member?.key) continue;
+    const current = members.get(member.key);
+    members.set(member.key, !current || (member.lastSeen || 0) >= (current.lastSeen || 0) ? member : current);
+  }
+  return [...members.values()];
+}
+function mergeLegacyState(legacy, current) {
+  if (!current) return legacy;
+  if (!legacy) return current;
+  const legacyParty = legacy.party, currentParty = current.party;
+  const sameParty = legacyParty && currentParty
+    && legacyParty.name === currentParty.name && Number(legacyParty.port) === Number(currentParty.port);
+  if (!sameParty) return current;
+  const recent = uniqueBy([...(legacy.recent || []), ...(current.recent || [])], party => `${party.name}\u0000${party.address}`)
+    .sort((a, b) => (b.lastUsed || 0) - (a.lastUsed || 0)).slice(0, 4);
+  return {
+    ...legacy, ...current,
+    profile: { ...(legacy.profile || {}), ...(current.profile || {}) },
+    party: {
+      ...legacyParty, ...currentParty,
+      channels: uniqueBy([...(legacyParty.channels || []), ...(currentParty.channels || [])], channel => channel.id),
+      members: mergeMembers(legacyParty.members, currentParty.members),
+    },
+    history: mergeConversations(legacy.history, current.history),
+    recent,
+  };
+}
+function configureUserData() {
+  const appData = app.getPath('appData');
+  const destination = path.join(appData, USER_DATA_NAME);
+  fs.mkdirSync(destination, { recursive: true });
+  const targetState = path.join(destination, STATE_FILE);
+  for (const legacyName of ['party-p2p']) {
+    const legacy = path.join(appData, legacyName);
+    const state = path.join(legacy, STATE_FILE);
+    if (fs.existsSync(state)) {
+      const migrated = mergeLegacyState(readState(state), readState(targetState));
+      if (migrated && JSON.stringify(migrated) !== JSON.stringify(readState(targetState)))
+        fs.writeFileSync(targetState, JSON.stringify(migrated), 'utf8');
+    }
+    if (fs.existsSync(legacy)) {
+      for (const name of fs.readdirSync(legacy).filter(name => name.startsWith('profile-avatar.'))) {
+        const target = path.join(destination, name);
+        if (!fs.existsSync(target)) fs.copyFileSync(path.join(legacy, name), target);
+      }
+    }
+  }
+  app.setPath('userData', destination);
+}
+configureUserData();
 const partyStore = require('./party-store');
 
 let srv = null;
@@ -119,10 +202,11 @@ ipcMain.handle('party:start', async (_, o) => {
   stop();
   try {
     const port = Number(o.port) || 7777;
-    const saved = partyStore.beginParty({ port, name: o.name, password: o.password });
+    const saved = partyStore.beginParty({ port, name: o.name, password: o.password, ownerDevice: o.ownerDevice });
     srv = await startServer({
-      port, name: o.name, password: o.password, channels: saved.channels,
+      port, name: o.name, password: o.password, channels: saved.channels, memberHistory: saved.members, history: saved.history, ownerDevice: saved.ownerDevice,
       onChannelsChange: channels => partyStore.saveChannels(channels),
+      onMembersChange: members => partyStore.saveMembers(members),
     });
     const ips = Object.entries(os.networkInterfaces()).flatMap(([name, list]) =>
       list.filter(a => a.family === 'IPv4' && !a.internal).map(a => ({ name, ip: a.address })));
@@ -132,10 +216,67 @@ ipcMain.handle('party:start', async (_, o) => {
   }
 });
 ipcMain.handle('party:stop', () => stop());
+ipcMain.handle('party:members', () => srv?.members() || []);
+ipcMain.handle('party:member-action', (_, { action, key } = {}) => {
+  if (!srv) return { error: 'Nenhuma party está ativa.' };
+  const actions = { kick: 'kick', remove: 'remove', ban: 'ban', unban: 'unban' };
+  if (!actions[action]) return { error: 'Ação de membro inválida.' };
+  return { members: srv[actions[action]](key) };
+});
+ipcMain.handle('party:member-permission', (_, { key, role } = {}) => {
+  if (!srv) return { error: 'Nenhuma party está ativa.' };
+  return { members: srv.setRole(key, role) };
+});
+ipcMain.handle('party:channels', () => srv?.channels() || []);
+ipcMain.handle('party:channel-update', (_, { id, changes } = {}) => {
+  if (!srv) return { error: 'Nenhuma party está ativa.' };
+  const channel = srv.updateChannel(id, changes);
+  return channel ? { channel } : { error: 'Canal inválido.' };
+});
+ipcMain.handle('party:channel-remove', (_, id) => {
+  if (!srv) return { error: 'Nenhuma party está ativa.' };
+  return srv.removeChannel(id) ? { ok: true } : { error: 'Canal inválido.' };
+});
 ipcMain.handle('persistence:load', () => partyStore.snapshot());
 ipcMain.handle('persistence:profile', (_, profile) => partyStore.saveProfile(profile));
-ipcMain.handle('persistence:history', (_, history) => partyStore.saveHistory(history));
+ipcMain.handle('persistence:history:sync', (_, history) => srv?.setHistory(history));
+ipcMain.handle('persistence:history', (_, history) => {
+  partyStore.saveHistory(history);
+  srv?.setHistory(history);
+});
 ipcMain.handle('persistence:recent', (_, party) => partyStore.saveRecent(party));
+
+const avatarMime = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp' };
+const avatarPath = () => path.join(app.getPath('userData'), path.basename(partyStore.snapshot().profile.avatar || ''));
+function readAvatar() {
+  const saved = partyStore.snapshot().profile.avatar || '';
+  const mime = avatarMime[path.extname(saved).toLowerCase()];
+  if (!saved || !mime) return null;
+  try { return `data:${mime};base64,${fs.readFileSync(avatarPath()).toString('base64')}`; }
+  catch { return null; }
+}
+ipcMain.handle('profile:photo', () => readAvatar());
+ipcMain.handle('profile:photo:choose', async () => {
+  const picked = await dialog.showOpenDialog({ properties: ['openFile'], filters: [{ name: 'Imagens', extensions: ['png', 'jpg', 'jpeg', 'webp'] }] });
+  if (picked.canceled || !picked.filePaths[0]) return { canceled: true };
+  const source = picked.filePaths[0], ext = path.extname(source).toLowerCase();
+  const info = await fs.promises.stat(source);
+  if (!avatarMime[ext] || info.size > 10 * 1024 * 1024) return { error: 'Escolha uma imagem PNG, JPG ou WebP de até 10 MB.' };
+  const folder = app.getPath('userData');
+  await fs.promises.mkdir(folder, { recursive: true });
+  await Promise.all((await fs.promises.readdir(folder)).filter(name => name.startsWith('profile-avatar.'))
+    .map(name => fs.promises.rm(path.join(folder, name), { force: true })));
+  const name = `profile-avatar${ext}`;
+  await fs.promises.copyFile(source, path.join(folder, name));
+  partyStore.saveAvatar(name);
+  return { url: readAvatar() };
+});
+ipcMain.handle('profile:photo:remove', async () => {
+  const saved = partyStore.snapshot().profile.avatar;
+  if (saved) await fs.promises.rm(avatarPath(), { force: true });
+  partyStore.saveAvatar('');
+  return { ok: true };
+});
 ipcMain.handle('update:check', async () => {
   try { return await checkForUpdate(); }
   catch (error) { return { status: 'error', message: error.message }; }
@@ -145,6 +286,17 @@ ipcMain.handle('update:download', async event => {
   catch (error) { return { status: 'error', message: error.message }; }
 });
 ipcMain.handle('update:install', () => installUpdate());
+ipcMain.handle('window:maximize-for-floating', event => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win) return { wasMaximized: false };
+  const wasMaximized = win.isMaximized();
+  if (!wasMaximized) win.maximize();
+  return { wasMaximized };
+});
+ipcMain.handle('window:restore-after-floating', event => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (win?.isMaximized()) win.unmaximize();
+});
 
 // Compartilhamento de tela: o app lista as telas/janelas, a pessoa escolhe e o id fica guardado
 // até o getDisplayMedia() do renderer pedir a captura.

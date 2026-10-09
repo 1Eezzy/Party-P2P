@@ -3,17 +3,43 @@ const $ = s => document.querySelector(s);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const hue = s => [...String(s)].reduce((a, c) => a + c.charCodeAt(0) * 31, 7) % 360;
 const RTC = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+const deviceId = (() => {
+  const saved = localStorage.getItem('party-p2p-device-id');
+  if (saved) return saved;
+  const id = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  localStorage.setItem('party-p2p-device-id', id);
+  return id;
+})();
 
-const S = { id: '', nick: '', party: '', invite: [], cur: null, voice: null, mic: null, share: null, shareAudio: null, q: null, muted: false, deaf: false };
+const S = { id: '', nick: '', party: '', role: 'member', memberKey: '', invite: [], cur: null, voice: null, mic: null, share: null, shareAudio: null, q: null, muted: false, deaf: false };
 const peers = new Map(), convs = new Map(), speaking = new Set(), watchers = new Map();
-let ws, ac, mode = 'join', hosting = false, lastConnection = null;
+let ws, ac, mode = 'join', hosting = false, lastConnection = null, floatingPeer = null;
+let floatingWindowMaximizedByUs = false;
 let historyTimer = null;
 const U = { state: 'idle', version: '', progress: null };
+let partyMembers = null, partySubtab = 'users';
 
 // Conversas: 'text' / 'voice' (canais da party), 'group' (grupo) e 'dm' (individual).
 const nickOf = id => (id === S.id ? S.nick : peers.get(id)?.nick || '?');
 const dmId = pid => 'd-' + [S.id, pid].sort().join('-');
 const ensure = c => (convs.has(c.id) || convs.set(c.id, { msgs: [], unread: 0, ...c }), convs.get(c.id));
+const avatarIcon = (nick, avatar) => `<i${avatar ? ' class="photo"' : ''} style="--h:${hue(nick)}${avatar ? `;background-image:url('${esc(avatar)}')` : ''}">${avatar ? '' : esc(nick[0] || '?')}</i>`;
+const canAccess = c => !['text', 'voice'].includes(c?.type) || hosting || !c.restricted || (c.access || []).includes(S.memberKey);
+function applyChannel(channel) {
+  const current = convs.get(channel.id);
+  if (current) Object.assign(current, { ...channel });
+  else ensure({ ...channel, msgs: [], unread: 0 });
+  if (S.cur === channel.id && !canAccess(channel)) S.cur = null;
+  render();
+}
+function removeChannelLocal(id) {
+  const channel = convs.get(id);
+  if (S.voice === id) leaveVoice();
+  convs.delete(id);
+  if (S.cur === id) S.cur = convs.keys().next().value || null;
+  if (channel) persistHistory();
+  render();
+}
 const dmConv = pid => ensure({ id: dmId(pid), type: 'dm', peer: pid });
 const others = c => (c.type === 'dm' ? [c.peer] : c.type === 'group' ? c.members.filter(i => i !== S.id) : [...peers.keys()]);
 const title = c => (c.type === 'dm' ? nickOf(c.peer) : c.name);
@@ -30,11 +56,28 @@ function historySnapshot() {
 }
 function persistHistory() {
   if (!hosting) return;
+  const snapshot = historySnapshot();
+  bridge.persistence.syncHistory(snapshot).catch(() => {});
   clearTimeout(historyTimer);
-  historyTimer = setTimeout(() => bridge.persistence.saveHistory(historySnapshot()).catch(() => {}), 500);
+  historyTimer = setTimeout(() => bridge.persistence.saveHistory(snapshot).catch(() => {}), 500);
 }
 function restoreHistory(history) {
   (history || []).forEach(c => ensure({ ...c, msgs: Array.isArray(c.msgs) ? c.msgs : [], unread: 0 }));
+}
+function applyGroup(group) {
+  const current = convs.get(group.id);
+  if (current && current.owner && current.owner !== group.owner) return;
+  const next = {
+    id: String(group.id), type: 'group', name: String(group.name).slice(0, 30),
+    owner: String(group.owner || ''), members: group.members.map(String),
+  };
+  if (current) Object.assign(current, next);
+  else ensure(next);
+}
+function removeGroup(id) {
+  convs.delete(id);
+  if (S.cur === id) S.cur = convs.keys().next().value || null;
+  persistHistory(); render();
 }
 let recentParties = [];
 function renderRecentParties(parties) {
@@ -63,23 +106,45 @@ const QUAL = [
 function connect(addr, nick, password) {
   lastConnection = { address: addr, nick, password };
   ws = new WebSocket('ws://' + (addr.includes(':') ? addr : addr + ':7777'));
-  ws.onopen = () => ws.send(JSON.stringify({ t: 'join', nick, password }));
+  ws.onopen = () => ws.send(JSON.stringify({ t: 'join', nick, password, device: deviceId, avatar: S.avatar || null }));
   ws.onerror = () => fail('Não foi possível conectar ao host. Confira o endereço, a porta e o firewall.');
   ws.onclose = () => S.id && toast('O host da party saiu. Quem já está conectado continua, mas ninguém novo consegue entrar.');
   ws.onmessage = e => {
     const m = JSON.parse(e.data);
-    if (m.t === 'error') fail(m.msg);
+    if (m.t === 'error') {
+      if (S.id) {
+        toast(m.msg);
+        ws.onclose = null;
+        setTimeout(() => location.reload(), 900);
+      } else fail(m.msg);
+    }
     else if (m.t === 'welcome') {
-      S.id = m.id; S.party = m.party;
+      S.id = m.id; S.party = m.party; S.role = m.role || 'member'; S.memberKey = m.memberKey || '';
       if (!hosting && lastConnection) bridge.persistence.saveRecent({ name: S.party, ...lastConnection }).catch(() => {});
-      m.channels.forEach(ensure);
-      m.members.forEach(x => addPeer(x.id, x.nick, true)); // quem chega liga para quem já está
+      restoreHistory(m.history);
+      m.channels.forEach(channel => Object.assign(ensure(channel), channel));
+      m.members.forEach(x => addPeer(x.id, x.nick, true, x.avatar)); // quem chega liga para quem já está
       enter(); open(m.channels[0].id);
     }
-    else if (m.t === 'peer-join') addPeer(m.id, m.nick, false);
+    else if (m.t === 'peer-join') addPeer(m.id, m.nick, false, m.avatar);
     else if (m.t === 'peer-leave') removePeer(m.id);
+    else if (m.t === 'peer-avatar') {
+      const peer = peers.get(m.id);
+      if (peer) { peer.avatar = m.avatar || null; render(); }
+    }
     else if (m.t === 'signal') onSig(m.from, m.data);
-    else if (m.t === 'channel-add') { ensure(m.ch); render(); }
+    else if (m.t === 'channel-add' || m.t === 'channel-update') applyChannel(m.ch);
+    else if (m.t === 'channel-remove') removeChannelLocal(m.id);
+    else if (m.t === 'admin-members') {
+      partyMembers = Array.isArray(m.members) ? m.members : [];
+      if (settingsTab === 'party') renderPartySettings();
+    }
+    else if (m.t === 'permission') {
+      S.role = m.role || 'member';
+      if (settingsTab === 'party' && !hosting && S.role !== 'admin') {
+        settingsTab = 'profile'; renderSettingsTab();
+      } else if (settingsTab === 'party') renderPartySettings();
+    }
   };
 }
 function fail(msg) {
@@ -89,15 +154,15 @@ function fail(msg) {
 }
 
 // ───────── Malha P2P (WebRTC): 1 conexão por par com canal de dados + áudio ─────────
-function addPeer(id, nick, init) {
-  const p = { id, nick, voice: null, m: false, pend: [], state: 'new', sharing: false, watch: false, watching: false, vtrack: null };
+function addPeer(id, nick, init, avatar = null) {
+  const p = { id, nick, avatar: avatar || null, voice: null, m: false, pend: [], state: 'new', sharing: false, watch: false, watching: false, vtrack: null };
   const pc = (p.pc = new RTCPeerConnection(RTC));
   peers.set(id, p);
   pc.onicecandidate = e => e.candidate && sig(id, { ice: e.candidate });
   pc.ondatachannel = e => bind(p, e.channel);
   pc.onconnectionstatechange = () => { p.state = pc.connectionState; render(); };
   pc.ontrack = e => {
-    if (e.track.kind === 'video') { p.vstream = new MediaStream([e.track]); return; }
+    if (e.track.kind === 'video') { p.vstream = new MediaStream([e.track]); render(); return; }
     p.astream ||= new MediaStream(); p.astream.addTrack(e.track);
     p.el ||= new Audio(); p.el.srcObject = p.astream;
     p.el.play().catch(() => {}); watch(id, p.astream); apply();
@@ -150,14 +215,17 @@ function bind(p, dc) {
 function handle(p, m) {
   if (m.t === 'msg') {
     const c = m.c === 'dm' ? dmConv(p.id) : convs.get(m.c);
-    if (!c || c.type === 'dm' && m.c !== 'dm' || c.type === 'group' && !c.members.includes(p.id)) return;
+    if (!c || !canAccess(c) || c.type === 'dm' && m.c !== 'dm' || c.type === 'group' && !c.members.includes(p.id)) return;
     c.msgs.push({ n: p.nick, text: String(m.text).slice(0, 2000), ts: Date.now() });
     persistHistory();
     if (S.cur !== c.id) c.unread++;
     render();
   } else if (m.t === 'group') {
-    if (String(m.id).startsWith('g-') && m.members?.includes(S.id) && m.members.includes(p.id))
-      { ensure({ id: m.id, type: 'group', name: String(m.name).slice(0, 30), members: m.members }); persistHistory(); render(); }
+    if (String(m.id).startsWith('g-') && m.members?.includes(S.id) && (p.nick === m.owner || p.nick === m.manager))
+      { applyGroup(m); persistHistory(); render(); }
+  } else if (m.t === 'group-remove' || m.t === 'group-delete') {
+    const c = convs.get(m.id);
+    if (c?.owner === m.owner && (p.nick === m.owner || p.nick === m.manager)) removeGroup(m.id);
   } else if (m.t === 'watch') {
     p.watching = !!m.on; apply();
   } else if (m.t === 'voice') {
@@ -198,6 +266,7 @@ function setVideo(p, track) {
 }
 
 async function joinVoice(id) {
+  if (!canAccess(convs.get(id))) return toast('Você não tem acesso a este canal.');
   try {
     if (!S.mic) {
       const st = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
@@ -273,23 +342,57 @@ function resetWatch() {
 function renderStage() {
   const st = $('#stage'), live = !!S.voice && S.cur === S.voice;
   const sh = live ? [...peers.values()].filter(p => p.sharing && p.voice === S.voice) : [];
-  const key = [live && S.share ? 'eu' : '', ...sh.map(p => p.id + (p.watch ? 'w' : ''))].join(',');
-  if (st.dataset.k === key) return;
+  const key = [live && S.share ? 'eu' : '', floatingPeer || '', ...sh.map(p => p.id + (p.watch ? 'w' : '') + (p.vstream ? 'v' : ''))].join(',');
+  if (st.dataset.k === key) { renderFloating(sh); return; }
   st.dataset.k = key;
   const tiles = [];
   const tile = html => Object.assign(document.createElement('div'), { className: 'tile', innerHTML: html });
   if (live && S.share) tiles.push(tile('<div class="ph">Você está transmitindo sua tela<button class="bad" data-unshare>Parar</button></div>'));
   sh.forEach(p => {
+    if (p.id === floatingPeer) return;
     if (!p.watch || !p.vstream) return tiles.push(tile(`<div class="ph"><b>${esc(p.nick)}</b> está transmitindo<button class="go" data-watch="${p.id}">Assistir</button></div>`));
     if (!p.vel) {
       p.vel = Object.assign(document.createElement('video'), { autoplay: true, muted: true });
-      p.vel.ondblclick = () => fullScreen(p);
+      p.vel.ondblclick = () => floatScreen(p.id);
     }
     p.vel.srcObject = p.vstream;
-    const t = tile(`<span class="tl">${esc(p.nick)}</span><div class="tb"><button data-full="${p.id}">Tela cheia</button><button data-unwatch="${p.id}">Parar de assistir</button></div>`);
+    const t = tile(`<span class="tl">${esc(p.nick)}</span><div class="tb"><button data-float="${p.id}" title="Abrir tela flutuante">⧉</button><button data-unwatch="${p.id}">Parar de assistir</button></div>`);
     p.tile = t; t.prepend(p.vel); tiles.push(t); p.vel.play().catch(() => {});
   });
   st.replaceChildren(...tiles); st.hidden = !tiles.length;
+  renderFloating(sh);
+}
+
+function renderFloating(shared) {
+  const panel = $('#floating-screen'), host = $('#floating-screen-video');
+  const peer = shared.find(p => p.id === floatingPeer);
+  if (!peer || !peer.watch || !peer.vstream) { panel.hidden = true; return; }
+  if (!peer.vel) {
+    peer.vel = Object.assign(document.createElement('video'), { autoplay: true, muted: true });
+    peer.vel.ondblclick = () => fullScreen(peer);
+  }
+  peer.vel.srcObject = peer.vstream;
+  $('#floating-screen-title').textContent = `Transmissão de ${peer.nick}`;
+  host.replaceChildren(peer.vel); panel.hidden = false; peer.vel.play().catch(() => {});
+}
+
+function floatScreen(id) {
+  floatingPeer = id; renderStage();
+}
+function closeFloating() {
+  floatingPeer = null;
+  exitFloatingMaximized();
+  renderStage();
+}
+
+async function exitFloatingMaximized() {
+  const panel = $('#floating-screen');
+  if (!panel.classList.contains('floating-maximized')) return;
+  panel.classList.remove('floating-maximized');
+  $('#floating-full').textContent = '⛶';
+  $('#floating-full').title = 'Tela cheia';
+  if (floatingWindowMaximizedByUs) await bridge.window.restoreAfterFloating();
+  floatingWindowMaximizedByUs = false;
 }
 
 // Indicador de quem está falando (analisador de volume em cada fluxo de áudio)
@@ -309,12 +412,14 @@ const paint = () => document.querySelectorAll('[data-u]').forEach(e => e.classLi
 
 // ───────── Ações ─────────
 function open(id) {
-  S.cur = id; convs.get(id).unread = 0; render(); $('#txt').focus();
+  const channel = convs.get(id);
+  if (!channel || !canAccess(channel)) return toast('Você não tem acesso a este canal.');
+  S.cur = id; channel.unread = 0; render(); $('#txt').focus();
 }
 
 function say(text) {
   const c = convs.get(S.cur); text = text.trim();
-  if (!c || !text) return;
+  if (!c || !text || !canAccess(c)) return;
   const ts = Date.now();
   c.msgs.push({ n: S.nick, text, ts });
   persistHistory();
@@ -335,10 +440,39 @@ function ask(kind) {
     if (kind !== 'group') return ws.send(JSON.stringify({ t: 'channel-add', type: kind, name: n }));
     const members = [S.id, ...[...d.querySelectorAll('[type=checkbox]:checked')].map(x => x.value)];
     const id = 'g-' + Math.random().toString(36).slice(2, 8);
-    ensure({ id, type: 'group', name: n, members });
+    ensure({ id, type: 'group', name: n, owner: S.nick, members });
     persistHistory();
-    tell(members.filter(i => i !== S.id), { t: 'group', id, name: n, members });
+    tell(members.filter(i => i !== S.id), { t: 'group', id, name: n, owner: S.nick, members });
     open(id);
+  };
+  d.showModal();
+}
+
+function manageGroup(id = S.cur) {
+  const c = convs.get(id);
+  if (!c || c.type !== 'group' || (!hosting && c.owner !== S.nick)) return;
+  const d = $('#manage-dlg'), ps = [...peers.values()];
+  d.className = '';
+  d.innerHTML = `<form method="dialog"><h3>Gerenciar ${esc(c.name)}</h3>
+    <input name="n" value="${esc(c.name)}" maxlength="30" required>
+    <p class="dim">Escolha quem pode acessar este grupo.</p>
+    <label class="ck"><input type="checkbox" checked disabled> ${esc(S.nick)} (criador)</label>` +
+    ps.map(p => `<label class="ck"><input type="checkbox" value="${p.id}"${c.members.includes(p.id) ? ' checked' : ''}> ${esc(p.nick)}</label>`).join('') +
+    `<menu><button value="delete" class="bad">Excluir grupo</button><button value="ok" class="go">Salvar acesso</button><button value="x" formnovalidate>Cancelar</button></menu></form>`;
+  d.returnValue = '';
+  d.onclose = () => {
+    if (d.returnValue === 'delete') {
+      tell(c.members.filter(id => id !== S.id), { t: 'group-delete', id: c.id, owner: c.owner, manager: S.nick });
+      return removeGroup(c.id);
+    }
+    if (d.returnValue !== 'ok') return;
+    const name = d.querySelector('[name=n]').value.trim(); if (!name) return;
+    const members = [S.id, ...[...d.querySelectorAll('[type=checkbox]:checked')].map(input => input.value).filter(Boolean)];
+    const removed = c.members.filter(id => !members.includes(id) && id !== S.id);
+    c.members = members; c.name = name;
+    tell(removed, { t: 'group-remove', id: c.id, owner: c.owner, manager: S.nick });
+    tell(members.filter(id => id !== S.id), { t: 'group', id: c.id, name: c.name, owner: c.owner, manager: S.nick, members });
+    persistHistory(); render();
   };
   d.showModal();
 }
@@ -389,16 +523,125 @@ function renderUpdateSettings() {
   }
 }
 
-function openSettings() {
-  const d = $('#dlg');
+let settingsTab = 'profile';
+function renderSettingsTab() {
+  const content = $('#settings-content'); if (!content) return;
+  if (settingsTab === 'updates') {
+    content.innerHTML = `<section class="setting"><b>Atualizações</b><p id="settings-update-detail" class="dim"></p><div id="settings-update-progress" class="update-progress" hidden><progress id="settings-update-meter" max="100" value="0"></progress><span id="settings-update-percent"></span></div><button type="button" id="settings-update"></button></section>`;
+    content.querySelector('#settings-update').onclick = updateApp;
+    renderUpdateSettings();
+    if (U.state === 'idle') checkForUpdate();
+    return;
+  }
+  if (settingsTab === 'party') {
+    renderPartySettings();
+    return;
+  }
+  content.innerHTML = `<section class="setting profile-setting"><b>Perfil</b><div class="profile-photo">${S.avatar ? `<img src="${esc(S.avatar)}" alt="Foto de perfil">` : `<i>${esc((S.nick || $('#nick').value || '?')[0])}</i>`}</div><p class="dim">A foto é salva neste computador e compartilhada com a party.</p><div class="acts"><button type="button" id="profile-photo-choose" class="go">Escolher foto</button>${S.avatar ? '<button type="button" id="profile-photo-remove">Remover</button>' : ''}</div></section>`;
+  content.querySelector('#profile-photo-choose').onclick = chooseProfilePhoto;
+  content.querySelector('#profile-photo-remove')?.addEventListener('click', removeProfilePhoto);
+}
+
+async function chooseProfilePhoto() {
+  const result = await bridge.profile.choosePhoto();
+  if (result.error) return toast(result.error);
+  if (result.url) { S.avatar = result.url; syncProfileAvatar(); renderSettingsTab(); render(); }
+}
+async function removeProfilePhoto() {
+  await bridge.profile.removePhoto(); S.avatar = null; syncProfileAvatar(); renderSettingsTab(); render();
+}
+function syncProfileAvatar() {
+  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ t: 'profile-avatar', avatar: S.avatar || null }));
+}
+
+async function renderPartySettings() {
+  const content = $('#settings-content'); if (!content || (!hosting && S.role !== 'admin')) return;
+  content.innerHTML = '<section class="setting"><b>Controle de usuários</b><p class="dim">Carregando membros…</p></section>';
+  if (!hosting && partyMembers === null) {
+    ws?.readyState === WebSocket.OPEN && ws.send(JSON.stringify({ t: 'admin-members' }));
+    return;
+  }
+  const members = hosting ? await bridge.party.members() : partyMembers;
+  if (settingsTab !== 'party' || !$('#settings-content')) return;
+  const managedChannels = hosting && partySubtab === 'content' ? await bridge.party.channels() : [];
+  if (settingsTab !== 'party' || !$('#settings-content')) return;
+  const timestamp = value => value ? new Date(value).toLocaleString('pt-BR') : 'Sem registro';
+  const tabs = `<div class="party-tabs"><button type="button" data-party-tab="users" class="${partySubtab === 'users' ? 'selected' : ''}">Usuários</button>${hosting ? `<button type="button" data-party-tab="permissions" class="${partySubtab === 'permissions' ? 'selected' : ''}">Permissões</button><button type="button" data-party-tab="content" class="${partySubtab === 'content' ? 'selected' : ''}">Canais e grupos</button>` : ''}</div>`;
+  const rows = members.map(member => {
+    const protectedAdmin = member.owner || (!hosting && member.role === 'admin');
+    const actions = protectedAdmin ? '' : member.banned
+      ? `<button type="button" data-member-action="unban" data-member="${esc(member.key)}">Remover banimento</button><button type="button" data-member-action="remove" data-member="${esc(member.key)}">Excluir registro</button>`
+      : `<button type="button" data-member-action="remove" data-member="${esc(member.key)}">${member.online ? 'Remover' : 'Remover registro'}</button><button type="button" class="bad" data-member-action="ban" data-member="${esc(member.key)}">Banir</button>`;
+    return `<article class="member-control"><div><b>${esc(member.nick)}</b><small>${member.owner ? 'Anfitrião · ' : ''}${member.role === 'admin' ? 'Administrador · ' : ''}${member.banned ? 'Banido' : member.online ? 'Online' : 'Offline'} · Último acesso: ${esc(timestamp(member.lastSeen))}</small></div><div class="member-actions">${actions}</div></article>`;
+  }).join('') || '<p class="dim">Ainda não houve acessos nesta party.</p>';
+  const permissions = members.map(member => `<article class="member-control"><div><b>${esc(member.nick)}</b><small>${member.owner ? 'Anfitrião e administrador da party' : member.role === 'admin' ? 'Administrador da party' : 'Usuário padrão'}</small></div><div class="member-actions">${member.owner ? '' : `<button type="button" data-member-role="${member.role === 'admin' ? 'member' : 'admin'}" data-member="${esc(member.key)}">${member.role === 'admin' ? 'Remover admin' : 'Tornar admin'}</button>`}</div></article>`).join('') || '<p class="dim">Ainda não houve acessos nesta party.</p>';
+  const groups = [...convs.values()].filter(conversation => conversation.type === 'group');
+  const contentManagement = `<div class="setting-heading"><div><b>Canais</b><p class="dim">Defina nome e quem pode acessar cada canal.</p></div></div><div class="member-controls">${managedChannels.map(channel => `<article class="member-control"><div><b>${channel.type === 'voice' ? '🔊' : '#'} ${esc(channel.name)}</b><small>${channel.restricted ? `${channel.access.length} usuário(s) com acesso` : 'Acesso para todos'}</small></div><div class="member-actions"><button type="button" data-channel-edit="${esc(channel.id)}">Editar</button><button type="button" class="bad" data-channel-remove="${esc(channel.id)}">Excluir</button></div></article>`).join('') || '<p class="dim">Nenhum canal.</p>'}</div><div class="setting-heading"><div><b>Grupos</b><p class="dim">Edite nome e participantes dos grupos registrados na party.</p></div></div><div class="member-controls">${groups.map(group => `<article class="member-control"><div><b>👥 ${esc(group.name)}</b><small>${Math.max(0, (group.members || []).length - 1)} participante(s) · Criado por ${esc(group.owner)}</small></div><div class="member-actions"><button type="button" data-group-settings="${esc(group.id)}">Editar</button></div></article>`).join('') || '<p class="dim">Nenhum grupo registrado.</p>'}</div>`;
+  const body = partySubtab === 'permissions'
+    ? `<p class="dim">Administradores podem gerenciar usuários, remover registros e aplicar banimentos.</p><div class="member-controls">${permissions}</div>`
+    : partySubtab === 'content' ? contentManagement
+    : `<div class="setting-heading"><div><b>Controle de usuários</b><p class="dim">Registro de todos os apelidos que já acessaram esta party.</p></div><button type="button" id="members-refresh">Atualizar</button></div><div class="member-controls">${rows}</div>`;
+  content.innerHTML = `<section class="setting">${tabs}${body}</section>`;
+  content.querySelectorAll('[data-party-tab]').forEach(button => button.onclick = () => { partySubtab = button.dataset.partyTab; renderPartySettings(); });
+  $('#members-refresh')?.addEventListener('click', () => {
+    if (!hosting) { partyMembers = null; ws?.send(JSON.stringify({ t: 'admin-members' })); }
+    renderPartySettings();
+  });
+  content.querySelectorAll('[data-member-action]').forEach(button => button.onclick = async () => {
+    const result = hosting
+      ? await bridge.party.memberAction(button.dataset.memberAction, button.dataset.member)
+      : (ws.send(JSON.stringify({ t: 'admin-action', action: button.dataset.memberAction, key: button.dataset.member })), null);
+    if (result?.error) toast(result.error);
+    if (hosting) renderPartySettings();
+  });
+  content.querySelectorAll('[data-member-role]').forEach(button => button.onclick = async () => {
+    const result = await bridge.party.memberPermission(button.dataset.member, button.dataset.memberRole);
+    if (result?.error) toast(result.error);
+    renderPartySettings();
+  });
+  content.querySelectorAll('[data-channel-edit]').forEach(button => button.onclick = () => editChannel(button.dataset.channelEdit, members));
+  content.querySelectorAll('[data-channel-remove]').forEach(button => button.onclick = async () => {
+    const result = await bridge.party.removeChannel(button.dataset.channelRemove);
+    if (result.error) toast(result.error); else removeChannelLocal(button.dataset.channelRemove);
+    renderPartySettings();
+  });
+  content.querySelectorAll('[data-group-settings]').forEach(button => button.onclick = () => manageGroup(button.dataset.groupSettings));
+}
+
+async function editChannel(id, members) {
+  const channels = await bridge.party.channels();
+  const channel = channels.find(item => item.id === id); if (!channel) return toast('Canal não encontrado.');
+  const d = $('#manage-dlg');
+  const access = new Set(channel.access || []);
   d.className = '';
-  d.innerHTML = `<form method="dialog"><h3>Configurações</h3>
-    <section class="setting"><b>Atualizações</b><p id="settings-update-detail" class="dim"></p><div id="settings-update-progress" class="update-progress" hidden><progress id="settings-update-meter" max="100" value="0"></progress><span id="settings-update-percent"></span></div><button type="button" id="settings-update"></button></section>
-    <menu><button value="ok" class="go">Fechar</button></menu></form>`;
-  d.querySelector('#settings-update').onclick = updateApp;
+  d.innerHTML = `<form method="dialog"><h3>Editar canal</h3><input name="n" value="${esc(channel.name)}" maxlength="30" required><label class="ck"><input name="restricted" type="checkbox"${channel.restricted ? ' checked' : ''}> Restringir acesso</label><div id="channel-access">${members.map(member => `<label class="ck"><input type="checkbox" name="access" value="${esc(member.key)}"${access.has(member.key) ? ' checked' : ''}> ${esc(member.nick)}${member.owner ? ' (anfitrião)' : ''}</label>`).join('') || '<p class="dim">Nenhum usuário registrado.</p>'}</div><menu><button value="ok" class="go">Salvar</button><button value="x" formnovalidate>Cancelar</button></menu></form>`;
+  const restricted = d.querySelector('[name=restricted]'), accessList = d.querySelector('#channel-access');
+  const updateAccessState = () => { accessList.hidden = !restricted.checked; };
+  restricted.onchange = updateAccessState; updateAccessState();
+  d.returnValue = '';
+  d.onclose = async () => {
+    if (d.returnValue !== 'ok') return;
+    const name = d.querySelector('[name=n]').value.trim(); if (!name) return;
+    const result = await bridge.party.updateChannel(channel.id, {
+      name, restricted: restricted.checked,
+      access: [...d.querySelectorAll('[name=access]:checked')].map(input => input.value),
+    });
+    if (result.error) return toast(result.error);
+    applyChannel(result.channel); renderPartySettings();
+  };
   d.showModal();
-  renderUpdateSettings();
-  if (U.state === 'idle') checkForUpdate();
+}
+
+function openSettings(tab = 'profile') {
+  settingsTab = tab;
+  const d = $('#dlg');
+  d.className = hosting ? 'wide' : '';
+  d.innerHTML = `<form method="dialog"><h3>Configurações</h3>
+    <div class="settings-tabs"><button type="button" data-settings-tab="profile">Perfil</button>${hosting || S.role === 'admin' ? '<button type="button" data-settings-tab="party">Party</button>' : ''}<button type="button" data-settings-tab="updates">Atualizações</button></div><div id="settings-content"></div>
+    <menu><button value="ok" class="go">Fechar</button></menu></form>`;
+  d.querySelectorAll('[data-settings-tab]').forEach(button => button.onclick = () => { settingsTab = button.dataset.settingsTab; renderSettingsTab(); });
+  d.showModal();
+  renderSettingsTab();
 }
 
 async function checkForUpdate() {
@@ -430,17 +673,23 @@ async function updateApp() {
   }
 }
 
-function fullScreen(peer) {
-  const target = peer?.tile || peer?.vel;
-  target?.requestFullscreen().catch(() => peer?.vel?.requestFullscreen().catch(() => {}));
+async function fullScreen(peer) {
+  if (peer && floatingPeer !== peer.id) floatScreen(peer.id);
+  const panel = $('#floating-screen');
+  if (panel.classList.contains('floating-maximized')) return exitFloatingMaximized();
+  const result = await bridge.window.maximizeForFloating();
+  floatingWindowMaximizedByUs = !result.wasMaximized;
+  panel.classList.add('floating-maximized');
+  $('#floating-full').textContent = '⤢';
+  $('#floating-full').title = 'Restaurar tamanho flutuante';
 }
 
 function render() {
   const cs = [...convs.values()], ps = [...peers.values()];
-  const by = ty => cs.filter(c => c.type === ty);
+  const by = ty => cs.filter(c => c.type === ty && canAccess(c));
   const inCall = c => [...(S.voice === c.id ? [S.id] : []), ...ps.filter(p => p.voice === c.id).map(p => p.id)];
   const row = (c, ic) => `<div class="it${S.cur === c.id ? ' on' : ''}" data-c="${c.id}"><u>${ic}</u><span>${esc(title(c))}</span>${c.unread ? `<b>${c.unread}</b>` : ''}</div>`;
-  const users = c => inCall(c).map(i => `<div class="vu" data-u="${i}"><i style="--h:${hue(nickOf(i))}">${esc(nickOf(i)[0])}</i>${esc(nickOf(i))}${(i === S.id ? S.share : peers.get(i).sharing) ? '<span class="live">Ao vivo</span>' : ''}${(i === S.id ? S.muted || S.deaf : peers.get(i).m) ? ' <s>🔇</s>' : ''}</div>`).join('');
+  const users = c => inCall(c).map(i => `<div class="vu" data-u="${i}">${avatarIcon(nickOf(i), i === S.id ? S.avatar : peers.get(i)?.avatar)}${esc(nickOf(i))}${(i === S.id ? S.share : peers.get(i).sharing) ? '<span class="live">Ao vivo</span>' : ''}${(i === S.id ? S.muted || S.deaf : peers.get(i).m) ? ' <s>🔇</s>' : ''}</div>`).join('');
   const sec = (t, k, list) => `<h4>${t}${k ? `<button data-new="${k}" title="Criar">+</button>` : ''}</h4>${list}`;
 
   $('#side').innerHTML =
@@ -449,7 +698,7 @@ function render() {
     sec('Grupos', 'group', by('group').map(c => row(c, '👥') + users(c)).join('') || '<p class="dim pad">Crie um grupo com o +.</p>') +
     sec('Membros', '', ps.map(p => {
       const d = convs.get(dmId(p.id));
-      return `<div class="it${S.cur === dmId(p.id) ? ' on' : ''}" data-dm="${p.id}" data-u="${p.id}"><i style="--h:${hue(p.nick)}">${esc(p.nick[0])}</i><span>${esc(p.nick)}</span>${p.voice === dmId(p.id) ? '📞' : ''}${d?.unread ? `<b>${d.unread}</b>` : ''}<em class="st ${p.state}"></em></div>`;
+      return `<div class="it${S.cur === dmId(p.id) ? ' on' : ''}" data-dm="${p.id}" data-u="${p.id}">${avatarIcon(p.nick, p.avatar)}<span>${esc(p.nick)}</span>${p.voice === dmId(p.id) ? '📞' : ''}${d?.unread ? `<b>${d.unread}</b>` : ''}<em class="st ${p.state}"></em></div>`;
     }).join('') || '<p class="dim pad">Só você por enquanto.</p>');
 
   const c = convs.get(S.cur);
@@ -457,7 +706,8 @@ function render() {
   $('#head').innerHTML = c
     ? `<h2>${ic[c.type]} ${esc(title(c))}</h2>` + (c.type === 'text' ? '' : S.voice === c.id
       ? `<div class="acts">${S.share ? '<button data-unshare>Parar transmissão</button>' : '<button data-share>🖥 Compartilhar tela</button>'}<button class="bad" data-leave>Sair da voz</button></div>`
-      : `<button class="go" data-join>${c.type === 'dm' ? '📞 Ligar' : 'Entrar na voz'}</button>`)
+      : `<button class="go" data-join>${c.type === 'dm' ? '📞 Ligar' : 'Entrar na voz'}</button>`) +
+      (c.type === 'group' && (hosting || c.owner === S.nick) ? '<button data-group-manage title="Gerenciar grupo">⚙</button>' : '')
     : '';
   $('#msgs').innerHTML = c
     ? c.msgs.map(m => `<div class="m"><i style="--h:${hue(m.n)}">${esc(m.n[0])}</i><div><b>${esc(m.n)}</b> <time>${new Date(m.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time><p>${esc(m.text)}</p></div></div>`).join('') || '<p class="dim">Nenhuma mensagem ainda. Escreva a primeira.</p>'
@@ -468,7 +718,10 @@ function render() {
   $('#bm').classList.toggle('off', S.muted || S.deaf);
   $('#bd').classList.toggle('off', S.deaf);
   $('#bl').hidden = !S.voice;
-  $('#av').style.setProperty('--h', hue(S.nick)); $('#av').textContent = S.nick[0] || ''; $('#mn').textContent = S.nick;
+  $('#av').style.setProperty('--h', hue(S.nick));
+  $('#av').classList.toggle('photo', !!S.avatar);
+  $('#av').style.backgroundImage = S.avatar ? `url("${S.avatar}")` : '';
+  $('#av').textContent = S.avatar ? '' : S.nick[0] || ''; $('#mn').textContent = S.nick;
   renderStage();
   paint();
 }
@@ -494,7 +747,7 @@ $('#lf').onsubmit = async e => {
   let addr = $('#addr').value.trim();
   if (mode === 'host') {
     const port = Number($('#port').value) || 7777;
-    const r = await bridge.start({ port, name: $('#pname').value.trim(), password: pass });
+    const r = await bridge.start({ port, name: $('#pname').value.trim(), password: pass, ownerDevice: deviceId });
     if (!r.ok) { $('#go').disabled = false; return ($('#err').textContent = r.error); }
     hosting = true; restoreHistory(r.history); S.invite = r.ips.map(i => `${i.ip}:${port}`); addr = '127.0.0.1:' + port;
   }
@@ -514,13 +767,14 @@ $('#head').onclick = e => {
   if (e.target.closest('[data-leave]')) leaveVoice();
   if (e.target.closest('[data-share]')) pickScreen();
   if (e.target.closest('[data-unshare]')) stopShare();
+  if (e.target.closest('[data-group-manage]')) manageGroup();
 };
 $('#stage').onclick = e => {
   const b = e.target.closest('button'); if (!b) return;
   const d = b.dataset;
   if (d.watch) watchOn(d.watch, true);
   else if (d.unwatch) watchOn(d.unwatch, false);
-  else if (d.full) fullScreen(peers.get(d.full));
+  else if (d.float) floatScreen(d.float);
   else if ('unshare' in d) stopShare();
 };
 $('#bm').onclick = () => { S.muted = !S.muted; announce(); apply(); render(); };
@@ -528,6 +782,64 @@ $('#bd').onclick = () => { S.deaf = !S.deaf; announce(); apply(); render(); };
 $('#bl').onclick = leaveVoice;
 $('#txt').onkeydown = e => { if (e.key === 'Enter') { say(e.target.value); e.target.value = ''; } };
 $('#login-settings').onclick = openSettings;
+$('#floating-close').onclick = closeFloating;
+$('#floating-full').onclick = () => fullScreen(peers.get(floatingPeer));
+const floatingPanel = $('#floating-screen');
+const resizeCursor = { n: 'n-resize', s: 's-resize', e: 'e-resize', w: 'w-resize', ne: 'ne-resize', nw: 'nw-resize', se: 'se-resize', sw: 'sw-resize' };
+function floatingResizeDirection(event) {
+  if (floatingPanel.classList.contains('floating-maximized')) return '';
+  const rect = floatingPanel.getBoundingClientRect(), edge = 10;
+  const vertical = event.clientY - rect.top < edge ? 'n' : rect.bottom - event.clientY < edge ? 's' : '';
+  const horizontal = event.clientX - rect.left < edge ? 'w' : rect.right - event.clientX < edge ? 'e' : '';
+  return vertical + horizontal;
+}
+function clearFloatingCursor() {
+  delete floatingPanel.dataset.resizeDirection;
+  floatingPanel.style.cursor = '';
+}
+floatingPanel.addEventListener('pointermove', event => {
+  if (event.buttons) return;
+  const direction = floatingResizeDirection(event);
+  if (direction) {
+    floatingPanel.dataset.resizeDirection = direction;
+    floatingPanel.style.cursor = resizeCursor[direction];
+  } else clearFloatingCursor();
+});
+floatingPanel.addEventListener('pointerleave', clearFloatingCursor);
+floatingPanel.addEventListener('pointerdown', event => {
+  if (event.button !== 0) return;
+  const direction = floatingResizeDirection(event);
+  if (!direction) return;
+  event.preventDefault(); event.stopPropagation();
+  const start = floatingPanel.getBoundingClientRect();
+  const minWidth = 300, minHeight = 200, x = event.clientX, y = event.clientY;
+  const clamp = (value, min, max) => Math.min(Math.max(value, min), Math.max(min, max));
+  const move = next => {
+    const dx = next.clientX - x, dy = next.clientY - y;
+    let left = start.left, top = start.top, width = start.width, height = start.height;
+    if (direction.includes('w')) { left = clamp(start.left + dx, 0, start.right - minWidth); width = start.right - left; }
+    if (direction.includes('e')) width = clamp(start.width + dx, minWidth, window.innerWidth - start.left);
+    if (direction.includes('n')) { top = clamp(start.top + dy, 0, start.bottom - minHeight); height = start.bottom - top; }
+    if (direction.includes('s')) height = clamp(start.height + dy, minHeight, window.innerHeight - start.top);
+    floatingPanel.style.left = `${left}px`; floatingPanel.style.top = `${top}px`;
+    floatingPanel.style.width = `${width}px`; floatingPanel.style.height = `${height}px`;
+    floatingPanel.style.right = 'auto'; floatingPanel.style.bottom = 'auto';
+  };
+  const end = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', end); clearFloatingCursor(); };
+  window.addEventListener('pointermove', move); window.addEventListener('pointerup', end);
+}, true);
+$('#floating-screen-title').onpointerdown = e => {
+  if (e.button !== 0 || floatingPanel.classList.contains('floating-maximized') || floatingResizeDirection(e)) return;
+  const panel = floatingPanel, start = panel.getBoundingClientRect();
+  const left = start.left, top = start.top, x = e.clientX, y = e.clientY;
+  const move = event => {
+    panel.style.left = `${Math.min(Math.max(0, left + event.clientX - x), window.innerWidth - start.width)}px`;
+    panel.style.top = `${Math.min(Math.max(0, top + event.clientY - y), window.innerHeight - start.height)}px`;
+    panel.style.right = 'auto'; panel.style.bottom = 'auto';
+  };
+  const end = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', end); };
+  window.addEventListener('pointermove', move); window.addEventListener('pointerup', end);
+};
 bridge.update.onProgress(progress => {
   if (U.state === 'downloading') { U.progress = progress; renderUpdateSettings(); }
 });
@@ -540,6 +852,7 @@ async function restoreLocalParty() {
   try {
     const saved = await bridge.persistence.load();
     $('#nick').value = saved.profile?.nick || '';
+    S.avatar = await bridge.profile.photo();
     renderRecentParties(saved.recent);
     if (!saved.party) return;
     $('#pname').value = saved.party.name || '';

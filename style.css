@@ -47,6 +47,7 @@ h4 button{padding:0 8px;border:0;background:none;color:var(--ac);font-size:18px;
 .vu{margin-left:24px;padding:3px 8px;color:var(--dim);font-size:13px}
 .vu s{text-decoration:none}
 i{display:grid;place-items:center;flex:none;width:26px;height:26px;border-radius:8px;background:hsl(var(--h) 45% 40%);font-style:normal;font-weight:700;font-size:12px;color:#fff}
+i.photo{background-position:center;background-size:cover;color:transparent}
 .speak>i{box-shadow:0 0 0 2px var(--bg),0 0 0 4px var(--ac)}
 .st{width:8px;height:8px;border-radius:50%;background:var(--dim)}
 .st.connected{background:var(--ac)}
@@ -68,6 +69,17 @@ i{display:grid;place-items:center;flex:none;width:26px;height:26px;border-radius
 #toasts{position:fixed;right:16px;bottom:16px;display:grid;gap:8px;max-width:360px}
 .toast{display:flex;gap:8px;align-items:center;background:var(--p2);border:1px solid var(--ac);border-radius:8px;padding:10px 12px}
 .toast span{flex:1}
+#floating-screen{position:fixed;z-index:20;right:24px;bottom:24px;width:520px;height:320px;min-width:300px;min-height:200px;overflow:hidden;background:#000;border:1px solid var(--ac);border-radius:10px;box-shadow:0 16px 45px #0009;touch-action:none}
+#floating-screen header{height:32px;padding:6px 10px;background:var(--p1);cursor:move;user-select:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#floating-screen-video{height:calc(100% - 32px)}
+#floating-screen-video video{width:100%;height:100%;object-fit:contain;background:#000}
+.floating-actions{position:absolute;right:6px;top:3px;display:flex;gap:4px}
+.floating-actions button{padding:2px 7px}
+#floating-screen.floating-maximized{inset:0!important;width:auto!important;height:auto!important;border:0;border-radius:0;box-shadow:none}
+#floating-screen.floating-maximized header{display:none}
+#floating-screen.floating-maximized #floating-screen-video{height:100%}
+#floating-screen.floating-maximized .floating-actions{opacity:.45;transition:opacity .15s}
+#floating-screen.floating-maximized:hover .floating-actions{opacity:1}
 dialog{background:var(--p1);color:var(--tx);border:1px solid var(--ln);border-radius:12px;padding:18px;width:320px}
 dialog::backdrop{background:#0b0d1ecc}
 dialog form{display:grid;gap:10px}
@@ -75,9 +87,25 @@ dialog h3{margin:0;font-size:18px}
 dialog menu{display:flex;flex-direction:row-reverse;gap:8px;margin:0;padding:0}
 .setting{display:grid;gap:8px;padding:10px;border:1px solid var(--ln);border-radius:8px}
 .setting p{margin:0}
+.settings-tabs{display:flex;gap:6px}
+.settings-tabs button{flex:1}
+.party-tabs{display:flex;gap:6px;border-bottom:1px solid var(--ln);padding-bottom:8px}
+.party-tabs button{flex:1}
+.party-tabs .selected{background:var(--ac);color:#09101e}
+.profile-setting{justify-items:start}
+.profile-photo{width:86px;height:86px;border-radius:50%;overflow:hidden;background:var(--p2);display:grid;place-items:center}
+.profile-photo img{width:100%;height:100%;object-fit:cover}
+.profile-photo i{width:100%;height:100%;border-radius:0;font-size:28px}
 .update-progress{display:flex;align-items:center;gap:8px}
 .update-progress progress{flex:1;accent-color:var(--ac)}
 .update-progress span{min-width:38px;text-align:right;font-variant-numeric:tabular-nums;color:var(--dim)}
+.setting-heading{display:flex;justify-content:space-between;gap:10px;align-items:start}
+.member-controls{display:grid;gap:7px;max-height:310px;overflow:auto}
+.member-control{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px;border-radius:7px;background:var(--p2)}
+.member-control small{display:block;margin-top:3px;color:var(--dim);font-size:11px}
+.member-actions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:5px}
+.member-actions button{padding:5px 7px;font-size:11px}
+#channel-access{display:grid;gap:6px;max-height:230px;overflow:auto}
 .ck{display:flex;gap:8px;align-items:center}
 .ck input{width:auto}
 
