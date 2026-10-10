@@ -18,6 +18,8 @@ let floatingWindowMaximizedByUs = false;
 let historyTimer = null;
 const U = { state: 'idle', version: '', progress: null };
 let partyMembers = null, partySubtab = 'users';
+let micDevice = localStorage.getItem('party-microphone') || '';
+let micTest = null, audioGeneration = 0, changingMic = false;
 
 // Conversas: 'text' / 'voice' (canais da party), 'group' (grupo) e 'dm' (individual).
 const nickOf = id => (id === S.id ? S.nick : peers.get(id)?.nick || '?');
@@ -124,7 +126,7 @@ function connect(addr, nick, password) {
       restoreHistory(m.history);
       m.channels.forEach(channel => Object.assign(ensure(channel), channel));
       m.members.forEach(x => addPeer(x.id, x.nick, true, x.avatar)); // quem chega liga para quem já está
-      enter(); open(m.channels[0].id);
+      enter(); open(m.channels[0].id); setWorkspaceView('home');
     }
     else if (m.t === 'peer-join') addPeer(m.id, m.nick, false, m.avatar);
     else if (m.t === 'peer-leave') removePeer(m.id);
@@ -165,7 +167,11 @@ function addPeer(id, nick, init, avatar = null) {
     if (e.track.kind === 'video') { p.vstream = new MediaStream([e.track]); render(); return; }
     p.astream ||= new MediaStream(); p.astream.addTrack(e.track);
     p.el ||= new Audio(); p.el.srcObject = p.astream;
-    p.el.play().catch(() => {}); watch(id, p.astream); apply();
+    p.el.play().catch(() => {});
+    // A faixa da transmissão de tela não deve acender o indicador de fala.
+    const microphone = pc.getTransceivers().filter(t => t.receiver.track.kind === 'audio')[0];
+    if (e.transceiver === microphone) watch(id, new MediaStream([e.track]));
+    apply();
   };
   if (init) {
     bind(p, pc.createDataChannel('d'));
@@ -269,7 +275,7 @@ async function joinVoice(id) {
   if (!canAccess(convs.get(id))) return toast('Você não tem acesso a este canal.');
   try {
     if (!S.mic) {
-      const st = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+      const st = await captureMic();
       S.mic = st.getAudioTracks()[0]; watch(S.id, st);
     }
   } catch { return toast('Sem acesso ao microfone. Verifique as permissões do Windows.'); }
@@ -284,6 +290,114 @@ function leaveVoice() {
   S.voice = null; S.mic?.stop(); S.mic = null; unwatch(S.id);
   announce(); apply(); render();
 }
+
+// Captura local: a seleção é persistida apenas neste dispositivo.
+function captureMic(device = micDevice) {
+  return navigator.mediaDevices.getUserMedia({ audio: {
+    echoCancellation: true, noiseSuppression: true, autoGainControl: true,
+    ...(device ? { deviceId: { exact: device } } : {}),
+  } });
+}
+function stopMicTest() {
+  audioGeneration++;
+  if (!micTest) return;
+  clearInterval(micTest.timer);
+  micTest.source.disconnect(); micTest.an.disconnect();
+  micTest.audio.pause(); micTest.audio.srcObject = null;
+  micTest.stream.getTracks().forEach(t => t.stop()); micTest = null;
+  const button = $('#test-mic'); if (button) button.textContent = 'Testar microfone';
+  const meter = $('#mic-meter'); if (meter) meter.value = 0;
+}
+async function listMicrophones() {
+  const select = $('#mic-device'); if (!select) return;
+  try {
+    const devices = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'audioinput');
+    if (!select.isConnected) return;
+    select.innerHTML = '<option value="">Padrão do sistema</option>' + devices.filter(d => d.deviceId !== 'default').map((d, i) => `<option value="${esc(d.deviceId)}">${esc(d.label || `Microfone ${i + 1}`)}</option>`).join('');
+    if (micDevice && !devices.some(d => d.deviceId === micDevice)) select.add(new Option('Microfone salvo indisponível — escolha outro', micDevice));
+    select.value = micDevice;
+  } catch { $('#mic-status').textContent = 'Não foi possível listar os microfones.'; }
+}
+function renderAudioSettings(content) {
+  content.innerHTML = `<section class="setting"><h3>Sua voz, do seu jeito.</h3><p class="dim">Escolha a entrada e confira o áudio antes de entrar na conversa.</p><label for="mic-device">Microfone de entrada</label><select id="mic-device"><option>Carregando…</option></select><button type="button" id="refresh-mics">Atualizar dispositivos</button><div class="mic-test-panel"><label for="mic-meter">Nível de entrada</label><meter id="mic-meter" min="0" max="100" value="0"></meter><label class="ck"><input type="checkbox" id="hear-mic">Ouvir meu microfone (use fones)</label><button type="button" id="test-mic" class="go">Testar microfone</button><p id="mic-status" class="dim" role="status">O teste é local. Se você estiver na voz, sua chamada continua normalmente.</p></div></section>`;
+  listMicrophones();
+  $('#refresh-mics').onclick = async () => {
+    let stream;
+    try { stream = await captureMic(''); await listMicrophones(); }
+    catch { if ($('#mic-status')) $('#mic-status').textContent = 'Permita o acesso ao microfone nas configurações do Windows.'; }
+    finally { stream?.getTracks().forEach(t => t.stop()); }
+  };
+  $('#mic-device').onchange = async e => {
+    if (changingMic) return;
+    stopMicTest(); changingMic = true; e.target.disabled = true;
+    const previous = micDevice, next = e.target.value;
+    let stream;
+    try {
+      stream = await captureMic(next);
+      if (S.voice) {
+        const old = S.mic; S.mic = stream.getAudioTracks()[0];
+        watch(S.id, stream); apply(); old?.stop(); stream = null;
+      }
+      micDevice = next; localStorage.setItem('party-microphone', next);
+      if ($('#mic-status')) $('#mic-status').textContent = 'Microfone selecionado. Pronto para falar.';
+      await listMicrophones();
+    } catch { e.target.value = previous; if ($('#mic-status')) $('#mic-status').textContent = 'Não foi possível usar esse microfone. Confira a conexão e as permissões.'; }
+    finally { stream?.getTracks().forEach(t => t.stop()); changingMic = false; e.target.disabled = false; }
+  };
+  $('#hear-mic').onchange = e => { if (micTest) micTest.audio.muted = !e.target.checked; };
+  $('#test-mic').onclick = async () => {
+    if (micTest) { stopMicTest(); $('#mic-status').textContent = 'Teste encerrado.'; return; }
+    const generation = ++audioGeneration;
+    const button = $('#test-mic'); button.disabled = true;
+    let stream;
+    try {
+      stream = await captureMic();
+      if (generation !== audioGeneration || !button.isConnected || !$('#dlg').open) { stream.getTracks().forEach(t => t.stop()); return; }
+      ac ||= new AudioContext(); await ac.resume();
+      if (generation !== audioGeneration) { stream.getTracks().forEach(t => t.stop()); return; }
+      const source = ac.createMediaStreamSource(stream), an = ac.createAnalyser(); an.fftSize = 512; source.connect(an);
+      const audio = new Audio(); audio.srcObject = stream; audio.muted = !$('#hear-mic').checked;
+      audio.play().catch(() => {});
+      const data = new Uint8Array(an.fftSize);
+      const timer = setInterval(() => {
+        an.getByteTimeDomainData(data);
+        const rms = Math.sqrt(data.reduce((sum, v) => sum + ((v - 128) / 128) ** 2, 0) / data.length);
+        if ($('#mic-meter')) $('#mic-meter').value = Math.min(100, rms * 350);
+      }, 60);
+      micTest = { source, an, stream, audio, timer };
+      button.textContent = 'Parar teste'; $('#mic-status').textContent = 'Teste ativo. Fale e acompanhe o nível de entrada.';
+      await listMicrophones();
+    } catch { stream?.getTracks().forEach(t => t.stop()); if ($('#mic-status')) $('#mic-status').textContent = 'Sem acesso ao microfone. Confira o dispositivo e as permissões do Windows.'; }
+    finally { button.disabled = false; }
+  };
+}
+navigator.mediaDevices.addEventListener('devicechange', () => listMicrophones());
+
+// RTT do par ICE selecionado. Considera a pior conexão ativa na sala de voz.
+let networkSampling = false;
+async function sampleNetwork() {
+  if (networkSampling) return;
+  networkSampling = true;
+  try {
+    const active = [...peers.values()].filter(p => !S.voice || p.voice === S.voice);
+    const values = await Promise.all(active.map(async p => {
+      try {
+        const stats = await p.pc.getStats(); let pair;
+        stats.forEach(s => { if (s.type === 'transport' && s.selectedCandidatePairId) pair = stats.get(s.selectedCandidatePairId); });
+        if (!pair) stats.forEach(s => { if (s.type === 'candidate-pair' && s.state === 'succeeded' && s.nominated) pair = s; });
+        return Number.isFinite(pair?.currentRoundTripTime) ? Math.round(pair.currentRoundTripTime * 1000) : null;
+      } catch { return null; }
+    }));
+    const measurements = values.filter(v => v !== null), ms = measurements.length ? Math.max(...measurements) : null;
+    const failed = active.some(p => ['failed', 'disconnected', 'closed'].includes(p.pc.connectionState));
+    const level = failed ? 'poor' : ms === null ? 'unknown' : ms < 100 ? 'good' : ms < 200 ? 'fair' : 'poor';
+    const box = $('#connection'); box.dataset.quality = level;
+    $('#connection-label').textContent = failed ? 'Conexão instável' : ms === null ? (active.length ? 'Medindo conexão…' : 'Sem outro participante') : `${ms} ms · ${level === 'good' ? 'Conexão boa' : level === 'fair' ? 'Atenção à rede' : 'Latência alta'}`;
+    box.title = 'Latência de ida e volta (RTT), pior conexão P2P' + (S.voice ? ' na sala atual.' : ' da party.') + ' Verde: abaixo de 100 ms. Amarelo: 100–199 ms. Vermelho: 200 ms ou mais. Não mede a velocidade da internet.';
+    syncWorkspaceNetwork();
+  } finally { networkSampling = false; }
+}
+setInterval(sampleNetwork, 2500);
 
 // ───────── Compartilhamento de tela ─────────
 // Cada par já tem uma faixa de vídeo e outra de áudio da transmissão negociadas. Elas só são
@@ -398,23 +512,29 @@ async function exitFloatingMaximized() {
 // Indicador de quem está falando (analisador de volume em cada fluxo de áudio)
 function watch(id, stream) {
   unwatch(id);
+  ac ||= new AudioContext(); ac.resume();
   const an = ac.createAnalyser(); an.fftSize = 512;
-  ac.createMediaStreamSource(stream).connect(an);
+  const source = ac.createMediaStreamSource(stream); source.connect(an);
   const buf = new Uint8Array(an.fftSize);
-  watchers.set(id, setInterval(() => {
+  let lastActive = 0;
+  const timer = setInterval(() => {
     an.getByteTimeDomainData(buf);
-    const on = buf.some(v => Math.abs(v - 128) > 10);
+    const rms = Math.sqrt(buf.reduce((sum, v) => sum + ((v - 128) / 128) ** 2, 0) / buf.length);
+    const allowed = id === S.id ? !!S.voice && !S.muted && !S.deaf : !!S.voice && peers.get(id)?.voice === S.voice && !peers.get(id)?.m;
+    if (rms > .025 && allowed) lastActive = performance.now();
+    const on = allowed && performance.now() - lastActive < 480;
     if (on !== speaking.has(id)) { on ? speaking.add(id) : speaking.delete(id); paint(); }
-  }, 100));
+  }, 60);
+  watchers.set(id, { timer, source, an });
 }
-function unwatch(id) { clearInterval(watchers.get(id)); watchers.delete(id); speaking.delete(id); paint(); }
+function unwatch(id) { const w = watchers.get(id); if (w) { clearInterval(w.timer); w.source.disconnect(); w.an.disconnect(); } watchers.delete(id); speaking.delete(id); paint(); }
 const paint = () => document.querySelectorAll('[data-u]').forEach(e => e.classList.toggle('speak', speaking.has(e.dataset.u)));
 
 // ───────── Ações ─────────
 function open(id) {
   const channel = convs.get(id);
   if (!channel || !canAccess(channel)) return toast('Você não tem acesso a este canal.');
-  S.cur = id; channel.unread = 0; render(); $('#txt').focus();
+  S.cur = id; channel.unread = 0; setWorkspaceView('chat'); render(); $('#txt').focus();
 }
 
 function say(text) {
@@ -525,7 +645,10 @@ function renderUpdateSettings() {
 
 let settingsTab = 'profile';
 function renderSettingsTab() {
+  stopMicTest();
   const content = $('#settings-content'); if (!content) return;
+  document.querySelectorAll('[data-settings-tab]').forEach(b => b.classList.toggle('selected', b.dataset.settingsTab === settingsTab));
+  if (settingsTab === 'audio') { renderAudioSettings(content); return; }
   if (settingsTab === 'updates') {
     content.innerHTML = `<section class="setting"><b>Atualizações</b><p id="settings-update-detail" class="dim"></p><div id="settings-update-progress" class="update-progress" hidden><progress id="settings-update-meter" max="100" value="0"></progress><span id="settings-update-percent"></span></div><button type="button" id="settings-update"></button></section>`;
     content.querySelector('#settings-update').onclick = updateApp;
@@ -633,11 +756,11 @@ async function editChannel(id, members) {
 }
 
 function openSettings(tab = 'profile') {
-  settingsTab = tab;
+  settingsTab = typeof tab === 'string' ? tab : 'profile';
   const d = $('#dlg');
-  d.className = hosting ? 'wide' : '';
+  d.className = 'wide';
   d.innerHTML = `<form method="dialog"><h3>Configurações</h3>
-    <div class="settings-tabs"><button type="button" data-settings-tab="profile">Perfil</button>${hosting || S.role === 'admin' ? '<button type="button" data-settings-tab="party">Party</button>' : ''}<button type="button" data-settings-tab="updates">Atualizações</button></div><div id="settings-content"></div>
+    <div class="settings-tabs"><button type="button" data-settings-tab="profile">Perfil</button><button type="button" data-settings-tab="audio">Voz e áudio</button>${hosting || S.role === 'admin' ? '<button type="button" data-settings-tab="party">Party</button>' : ''}<button type="button" data-settings-tab="updates">Atualizações</button></div><div id="settings-content"></div>
     <menu><button value="ok" class="go">Fechar</button></menu></form>`;
   d.querySelectorAll('[data-settings-tab]').forEach(button => button.onclick = () => { settingsTab = button.dataset.settingsTab; renderSettingsTab(); });
   d.showModal();
@@ -710,7 +833,7 @@ function render() {
       (c.type === 'group' && (hosting || c.owner === S.nick) ? '<button data-group-manage title="Gerenciar grupo">⚙</button>' : '')
     : '';
   $('#msgs').innerHTML = c
-    ? c.msgs.map(m => `<div class="m"><i style="--h:${hue(m.n)}">${esc(m.n[0])}</i><div><b>${esc(m.n)}</b> <time>${new Date(m.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time><p>${esc(m.text)}</p></div></div>`).join('') || '<p class="dim">Nenhuma mensagem ainda. Escreva a primeira.</p>'
+    ? c.msgs.map(m => `<div class="m">${avatarIcon(m.n, m.n === S.nick ? S.avatar : ps.find(p => p.nick === m.n)?.avatar)}<div><b>${esc(m.n)}</b> <time>${new Date(m.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time><p>${esc(m.text)}</p></div></div>`).join('') || '<div class="empty-chat"><span>✦</span><h3>O próximo papo começa aqui.</h3><p>Chame a galera e mande a primeira mensagem.</p></div>'
     : '';
   $('#msgs').scrollTop = 1e9;
   $('#txt').placeholder = c ? `Mensagem para ${title(c)}` : '';
@@ -722,7 +845,12 @@ function render() {
   $('#av').classList.toggle('photo', !!S.avatar);
   $('#av').style.backgroundImage = S.avatar ? `url("${S.avatar}")` : '';
   $('#av').textContent = S.avatar ? '' : S.nick[0] || ''; $('#mn').textContent = S.nick;
+  $('#my-profile').dataset.u = S.id;
+  const voicePanel = $('#voice-members');
+  voicePanel.hidden = !c || c.type === 'text';
+  voicePanel.innerHTML = c && c.type !== 'text' ? `<div class="voice-heading"><span>SALA DE VOZ</span><small>${inCall(c).length} conectado(s)</small></div><div class="voice-grid">${inCall(c).map(id => `<div class="voice-card" data-u="${id}">${avatarIcon(nickOf(id), id === S.id ? S.avatar : peers.get(id)?.avatar)}<strong>${esc(nickOf(id))}</strong><small>${(id === S.id ? S.muted || S.deaf : peers.get(id)?.m) ? 'Microfone silenciado' : 'Na conversa'}</small></div>`).join('') || '<p class="dim">Entre na voz e fique perto da sua party.</p>'}</div>` : '';
   renderStage();
+  renderWorkspace();
   paint();
 }
 
@@ -782,6 +910,10 @@ $('#bd').onclick = () => { S.deaf = !S.deaf; announce(); apply(); render(); };
 $('#bl').onclick = leaveVoice;
 $('#txt').onkeydown = e => { if (e.key === 'Enter') { say(e.target.value); e.target.value = ''; } };
 $('#login-settings').onclick = openSettings;
+$('#my-profile').onclick = () => openSettings('profile');
+$('#audio-settings').onclick = () => openSettings('audio');
+$('#dlg').addEventListener('close', stopMicTest);
+$('#dlg').addEventListener('cancel', stopMicTest);
 $('#floating-close').onclick = closeFloating;
 $('#floating-full').onclick = () => fullScreen(peers.get(floatingPeer));
 const floatingPanel = $('#floating-screen');

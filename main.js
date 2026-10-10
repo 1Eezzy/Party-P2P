@@ -322,7 +322,7 @@ app.whenReady().then(() => {
   });
   const win = new BrowserWindow({
     width: 1120, height: 720, minWidth: 820, minHeight: 520,
-    backgroundColor: '#1a1d33', autoHideMenuBar: true,
+    backgroundColor: '#0b1424', autoHideMenuBar: true,
     webPreferences: { preload: path.join(__dirname, 'preload.js') },
   });
   win.loadFile('index.html');
