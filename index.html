@@ -5,6 +5,7 @@
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src ws:; media-src 'self' blob: mediastream:; img-src 'self' data:">
   <title>Party P2P</title>
   <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="workspace.css">
 </head>
 <body>
   <section id="login">
@@ -32,11 +33,16 @@
   </section>
 
   <main id="app" hidden>
-    <nav>
+    <aside id="rail" aria-label="Navegação principal"></aside>
+    <header id="workspace-topbar"><div class="workspace-location"><span class="breadcrumb">WORKSPACE</span><strong id="workspace-title">Visão geral</strong></div><label class="workspace-search"><span id="search-icon"></span><input id="workspace-search" type="search" placeholder="Buscar canais e pessoas" aria-label="Buscar canais e pessoas"><kbd>/</kbd></label><div id="global-call" hidden></div><button id="top-profile" title="Meu perfil"></button></header>
+    <nav id="channel-sidebar">
+      <div class="brand"><span class="brand-mark">P</span> Party <span class="brand-tag">P2P</span></div>
       <header id="ph"></header>
       <div id="side"></div>
+      <div id="connection" role="status"><span class="signal-bars"><b></b><b></b><b></b></span><span id="connection-label">Aguardando conexão</span></div>
       <footer id="me">
-        <i id="av"></i><span id="mn"></span>
+        <button id="my-profile" title="Abrir meu perfil"><i id="av"></i><span><strong id="mn"></strong><small>Meu perfil</small></span></button>
+        <button id="audio-settings" title="Configurar e testar microfone" aria-label="Configurar e testar microfone">⚙</button>
         <button id="bm" title="Mutar microfone">🎙</button>
         <button id="bd" title="Ensurdecer">🎧</button>
         <button id="bl" class="bad" title="Sair da voz" hidden>☎</button>
@@ -44,10 +50,12 @@
     </nav>
     <section id="chat">
       <header id="head"></header>
+      <div id="voice-members" hidden></div>
       <div id="stage" hidden></div>
       <div id="msgs"></div>
       <input id="txt" autocomplete="off" maxlength="2000">
     </section>
+    <section id="workspace-page" aria-label="Conteúdo da aba"></section>
   </main>
 
   <div id="toasts"></div>
@@ -59,5 +67,6 @@
   <dialog id="dlg"></dialog>
   <dialog id="manage-dlg"></dialog>
   <script src="renderer.js"></script>
+  <script src="workspace.js"></script>
 </body>
 </html>
