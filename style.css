@@ -89,6 +89,7 @@ dialog menu{display:flex;flex-direction:row-reverse;gap:8px;margin:0;padding:0}
 .setting p{margin:0}
 .settings-tabs{display:flex;gap:6px}
 .settings-tabs button{flex:1}
+.settings-version{color:var(--dim);font-size:11px;font-variant-numeric:tabular-nums;text-align:right}
 .party-tabs{display:flex;gap:6px;border-bottom:1px solid var(--ln);padding-bottom:8px}
 .party-tabs button{flex:1}
 .party-tabs .selected{background:var(--ac);color:#09101e}

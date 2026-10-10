@@ -5,6 +5,7 @@ if (process.type === 'renderer') {
   contextBridge.exposeInMainWorld('bridge', {
     persistence: { load: async () => ({}), saveRecent: async () => {}, saveProfile: async () => {} },
     profile: { photo: async () => null }, update: { onProgress: () => {} },
+    app: { version: async () => '1.5.0' },
   });
 } else {
   const assert = require('node:assert/strict');
@@ -67,6 +68,7 @@ if (process.type === 'renderer') {
       await waitFor(a, '!speaking.has(S.id)');
       await run(a, 'S.muted=false; apply(); announce();');
       await run(a, "openSettings('audio')");
+      await waitFor(a, 'document.querySelector("#settings-app-version")?.textContent.includes("1.5.0")');
       await waitFor(a, 'document.querySelector("#mic-device").options.length > 1');
       await run(a, 'document.querySelector("#test-mic").click()');
       await waitFor(a, '!!micTest');

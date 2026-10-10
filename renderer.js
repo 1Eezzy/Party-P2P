@@ -17,6 +17,7 @@ let ws, ac, mode = 'join', hosting = false, lastConnection = null, floatingPeer 
 let floatingWindowMaximizedByUs = false;
 let historyTimer = null;
 const U = { state: 'idle', version: '', progress: null };
+const APP_INFO = { version: '' };
 let partyMembers = null, partySubtab = 'users';
 let micDevice = localStorage.getItem('party-microphone') || '';
 let micTest = null, audioGeneration = 0, changingMic = false;
@@ -622,16 +623,16 @@ function renderUpdateSettings() {
   const progress = $('#settings-update-progress'), meter = $('#settings-update-meter'), label = $('#settings-update-percent');
   if (!button || !detail) return;
   const labels = {
-    idle: 'Verificar atualizações', checking: 'Verificando…', available: `Baixar v${U.version}`,
-    downloading: 'Baixando…', downloaded: `Instalar v${U.version}`, installing: 'Reiniciando…',
+    idle: 'Verificar atualizações', checking: 'Verificando…', available: `Atualizar para v${U.version}`,
+    downloading: 'Baixando…', downloaded: `Instalar v${U.version}`, installing: 'Abrindo atualizador…',
   };
   const details = {
     idle: U.message || 'Consulte a versão mais recente publicada no GitHub.',
     checking: 'Consultando a release mais recente…',
-    available: `A versão ${U.version} está disponível para download.`,
+    available: `A versão ${U.version} está pronta para atualizar. O atualizador pedirá permissão de administrador.`,
     downloading: U.progress?.total ? `Baixando a atualização: ${U.progress.percent}% concluído.` : 'Baixando a atualização…',
     downloaded: `A versão ${U.version} foi baixada e está pronta para instalar.`,
-    installing: 'Encerrando a versão atual, substituindo o executável e abrindo a nova versão…',
+    installing: 'Abrindo o atualizador seguro. Acompanhe o progresso na próxima janela…',
   };
   button.textContent = labels[U.state] || 'Verificar atualizações';
   button.disabled = U.state === 'checking' || U.state === 'downloading' || U.state === 'installing';
@@ -761,10 +762,20 @@ function openSettings(tab = 'profile') {
   d.className = 'wide';
   d.innerHTML = `<form method="dialog"><h3>Configurações</h3>
     <div class="settings-tabs"><button type="button" data-settings-tab="profile">Perfil</button><button type="button" data-settings-tab="audio">Voz e áudio</button>${hosting || S.role === 'admin' ? '<button type="button" data-settings-tab="party">Party</button>' : ''}<button type="button" data-settings-tab="updates">Atualizações</button></div><div id="settings-content"></div>
+    <small id="settings-app-version" class="settings-version">Versão instalada: ${esc(APP_INFO.version || 'carregando…')}</small>
     <menu><button value="ok" class="go">Fechar</button></menu></form>`;
   d.querySelectorAll('[data-settings-tab]').forEach(button => button.onclick = () => { settingsTab = button.dataset.settingsTab; renderSettingsTab(); });
   d.showModal();
   renderSettingsTab();
+}
+
+async function loadAppVersion() {
+  try { APP_INFO.version = await bridge.app.version(); }
+  catch { APP_INFO.version = ''; }
+  const label = $('#settings-app-version');
+  if (label) label.textContent = APP_INFO.version
+    ? `Versão instalada: ${APP_INFO.version}`
+    : 'Versão instalada: indisponível';
 }
 
 async function checkForUpdate() {
@@ -783,16 +794,9 @@ async function checkForUpdate() {
 async function updateApp() {
   if (U.state === 'idle') return checkForUpdate();
   if (U.state === 'available') {
-    U.state = 'downloading'; U.progress = { percent: 0, total: 0 }; renderUpdateSettings();
-    const result = await bridge.update.download();
-    if (result.status === 'downloaded') {
-      U.state = 'downloaded'; U.version = result.version; U.progress = null;
-    } else { U.state = 'available'; U.progress = null; U.message = result.message || 'Não foi possível baixar a atualização.'; }
-    renderUpdateSettings();
-  } else if (U.state === 'downloaded') {
     U.state = 'installing'; renderUpdateSettings();
     const result = await bridge.update.install();
-    if (result.status !== 'installing') { U.state = 'downloaded'; U.message = result.message || 'Não foi possível instalar a atualização.'; renderUpdateSettings(); }
+    if (result.status !== 'installing') { U.state = 'available'; U.message = result.message || 'Não foi possível abrir o atualizador.'; renderUpdateSettings(); }
   }
 }
 
@@ -972,9 +976,6 @@ $('#floating-screen-title').onpointerdown = e => {
   const end = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', end); };
   window.addEventListener('pointermove', move); window.addEventListener('pointerup', end);
 };
-bridge.update.onProgress(progress => {
-  if (U.state === 'downloading') { U.progress = progress; renderUpdateSettings(); }
-});
 $('#recent-list').onclick = e => {
   const button = e.target.closest('[data-recent]');
   if (button) joinRecent(Number(button.dataset.recent));
@@ -995,3 +996,4 @@ async function restoreLocalParty() {
   } catch {}
 }
 restoreLocalParty();
+loadAppVersion();

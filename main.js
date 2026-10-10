@@ -92,7 +92,6 @@ const partyStore = require('./party-store');
 
 let srv = null;
 let pendingUpdate = null;
-let downloadedUpdate = null;
 const REPOSITORY = '1Eezzy/Party-P2P';
 const stop = () => { srv?.close(); srv = null; };
 
@@ -126,34 +125,6 @@ function request(url, redirects = 0) {
   });
 }
 
-function download(url, file, onProgress, redirects = 0) {
-  return new Promise((resolve, reject) => {
-    if (redirects > 5) return reject(new Error('Muitos redirecionamentos ao baixar a atualização.'));
-    const req = https.get(url, { headers: { 'User-Agent': 'Party-P2P-Updater' } }, res => {
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        res.resume();
-        return download(new URL(res.headers.location, url), file, onProgress, redirects + 1).then(resolve, reject);
-      }
-      if (res.statusCode !== 200) {
-        res.resume();
-        return reject(new Error(`Download indisponível (status ${res.statusCode}).`));
-      }
-      const total = Number(res.headers['content-length']) || 0;
-      let received = 0;
-      res.on('data', chunk => {
-        received += chunk.length;
-        onProgress?.({ received, total, percent: total ? Math.floor(received * 100 / total) : null });
-      });
-      const output = fs.createWriteStream(file);
-      res.pipe(output);
-      output.on('finish', () => output.close(resolve));
-      output.on('error', error => { output.destroy(); fs.rm(file, { force: true }, () => reject(error)); });
-    });
-    req.setTimeout(120000, () => req.destroy(new Error('Tempo esgotado ao baixar a atualização.')));
-    req.on('error', error => fs.rm(file, { force: true }, () => reject(error)));
-  });
-}
-
 function selectAsset(release) {
   const executables = (release.assets || []).filter(asset => /\.exe$/i.test(asset.name));
   const portable = !!process.env.PORTABLE_EXECUTABLE_DIR;
@@ -173,29 +144,97 @@ async function checkForUpdate() {
   return { status: 'available', version: pendingUpdate.version };
 }
 
-async function downloadUpdate(onProgress) {
+async function waitForFile(file, timeout = 20000) {
+  const end = Date.now() + timeout;
+  while (Date.now() < end) {
+    try { await fs.promises.access(file); return; }
+    catch { await new Promise(resolve => setTimeout(resolve, 100)); }
+  }
+  throw new Error('O módulo de atualização não conseguiu abrir. Tente novamente ou execute o Party P2P como administrador.');
+}
+
+function updaterFolder() {
+  return path.join(app.getPath('userData'), 'updater');
+}
+async function ensureUpdaterModule() {
+  const folder = updaterFolder();
+  const executable = path.join(folder, 'PartyP2P.Updater.exe');
+  const source = app.isPackaged
+    ? path.join(process.resourcesPath, 'updater', 'PartyP2P.Updater.exe')
+    : path.join(__dirname, 'build', 'updater', 'PartyP2P.Updater.exe');
+  await fs.promises.mkdir(folder, { recursive: true });
+  const [packaged, current] = await Promise.all([
+    fs.promises.readFile(source),
+    fs.promises.readFile(executable).catch(() => null),
+  ]);
+  if (!current || !current.equals(packaged)) {
+    const staged = `${executable}.new`;
+    await fs.promises.writeFile(staged, packaged);
+    await fs.promises.rm(executable, { force: true });
+    await fs.promises.rename(staged, executable);
+  }
+  // Migração do protótipo em PowerShell; o novo updater é um binário nativo.
+  await fs.promises.rm(path.join(folder, 'PartyP2P-Updater.ps1'), { force: true }).catch(() => {});
+  return executable;
+}
+function psQuote(value) {
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+function windowsArgument(value) {
+  // Start-Process junta arrays sem recolocar aspas. Retornamos uma única linha
+  // de comando já escapada para preservar caminhos como "Party P2P".
+  return `"${String(value).replace(/(\\*)"/g, '$1$1\\"').replace(/(\\*)$/g, '$1$1')}"`;
+}
+
+async function launchUpdateHelper() {
   if (!pendingUpdate) {
     const result = await checkForUpdate();
     if (result.status !== 'available') return result;
   }
-  const safeName = pendingUpdate.asset.name.replace(/[^a-z0-9._ -]/gi, '_');
-  const file = path.join(app.getPath('temp'), `Party-P2P-update-${pendingUpdate.version}-${safeName}`);
-  await fs.promises.rm(file, { force: true });
-  await download(pendingUpdate.asset.browser_download_url, file, onProgress);
-  downloadedUpdate = { ...pendingUpdate, file, portable: !!process.env.PORTABLE_EXECUTABLE_DIR };
-  return { status: 'downloaded', version: downloadedUpdate.version };
-}
+  if (!app.isPackaged) {
+    return { status: 'error', message: 'A instalação pelo atualizador está disponível apenas no executável distribuído.' };
+  }
 
-function installUpdate() {
-  if (!downloadedUpdate) return { status: 'error', message: 'Nenhuma atualização foi baixada.' };
-  const stopOldProcess = `taskkill /PID ${process.pid} /F > nul 2>&1`;
-  const command = downloadedUpdate.portable
-    ? `timeout /t 1 /nobreak > nul & ${stopOldProcess} & timeout /t 1 /nobreak > nul & for /L %i in (1,1,10) do @(move /y "${downloadedUpdate.file}" "${process.execPath}" > nul 2>&1 && (start "" "${process.execPath}" & exit /b) || timeout /t 1 /nobreak > nul)`
-    : `timeout /t 1 /nobreak > nul & ${stopOldProcess} & timeout /t 1 /nobreak > nul & start "" /wait "${downloadedUpdate.file}" /S & start "" "${process.execPath}"`;
-  const helper = spawn('cmd.exe', ['/d', '/s', '/c', command], { detached: true, stdio: 'ignore', windowsHide: true });
-  helper.unref();
-  setTimeout(() => app.quit(), 350);
-  return { status: 'installing' };
+  const folder = updaterFolder();
+  const readyPath = path.join(folder, `ready-${process.pid}-${Date.now()}.signal`);
+  const portableTarget = process.env.PORTABLE_EXECUTABLE_FILE;
+  const targetPath = portableTarget && path.isAbsolute(portableTarget) ? portableTarget : process.execPath;
+  let jobPath = '';
+  try {
+    const updater = await ensureUpdaterModule();
+    await fs.promises.rm(readyPath, { force: true });
+    jobPath = path.join(folder, `job-${process.pid}-${Date.now()}.json`);
+    const job = {
+      // O portable do electron-builder executa uma cópia extraída em TEMP.
+      // PORTABLE_EXECUTABLE_FILE é o .exe real que o usuário abriu.
+      TargetPath: targetPath,
+      ParentPid: process.pid,
+      DownloadUrl: pendingUpdate.asset.browser_download_url,
+      AssetDigest: pendingUpdate.asset.digest || '',
+      Version: pendingUpdate.version,
+      ReadyPath: readyPath,
+      Mode: process.env.PORTABLE_EXECUTABLE_DIR ? 'portable' : 'installer',
+    };
+    await fs.promises.writeFile(jobPath, JSON.stringify(job), { encoding: 'utf8', mode: 0o600 });
+    const commandLine = ['--job', jobPath].map(windowsArgument).join(' ');
+    const command = `$ErrorActionPreference = 'Stop'; Start-Process -FilePath ${psQuote(updater)} -ArgumentList ${psQuote(commandLine)} -Verb RunAs -PassThru | Out-Null`;
+    await new Promise((resolve, reject) => {
+      const launcher = spawn('powershell.exe', [
+        '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', command,
+      ], { windowsHide: true, stdio: 'ignore' });
+      launcher.once('error', reject);
+      launcher.once('exit', code => code === 0 ? resolve() : reject(new Error('A permissão de administrador foi recusada ou não pôde ser obtida.')));
+    });
+    // O app só fecha depois que o módulo persistente confirma sua janela.
+    await waitForFile(readyPath);
+    await fs.promises.rm(readyPath, { force: true });
+    setTimeout(() => app.quit(), 200);
+    return { status: 'installing', version: pendingUpdate.version };
+  } catch (error) {
+    await fs.promises.rm(readyPath, { force: true }).catch(() => {});
+    if (jobPath) await fs.promises.rm(jobPath, { force: true }).catch(() => {});
+    return { status: 'error', message: error.message };
+  }
 }
 
 ipcMain.handle('party:start', async (_, o) => {
@@ -281,11 +320,8 @@ ipcMain.handle('update:check', async () => {
   try { return await checkForUpdate(); }
   catch (error) { return { status: 'error', message: error.message }; }
 });
-ipcMain.handle('update:download', async event => {
-  try { return await downloadUpdate(progress => event.sender.send('update:progress', progress)); }
-  catch (error) { return { status: 'error', message: error.message }; }
-});
-ipcMain.handle('update:install', () => installUpdate());
+ipcMain.handle('app:version', () => app.getVersion());
+ipcMain.handle('update:install', () => launchUpdateHelper());
 ipcMain.handle('window:maximize-for-floating', event => {
   const win = BrowserWindow.fromWebContents(event.sender);
   if (!win) return { wasMaximized: false };
@@ -310,6 +346,8 @@ ipcMain.handle('screen:pick', (_, source) => {
 });
 
 app.whenReady().then(() => {
+  // Garante, silenciosamente, que o módulo acionável exista no AppData.
+  ensureUpdaterModule().catch(() => {});
   session.defaultSession.setPermissionRequestHandler((_, perm, cb) =>
     cb(['media', 'display-capture', 'clipboard-sanitized-write'].includes(perm)));
   session.defaultSession.setDisplayMediaRequestHandler((_, cb) => {

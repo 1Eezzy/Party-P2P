@@ -35,6 +35,19 @@ O teste abre duas instâncias ocultas e isoladas com microfones sintéticos, con
 
 Antes de distribuir, confira também em dois computadores com microfones reais: qualidade do som, retorno com fones, troca/desconexão de dispositivo e conexão pela rede/VPN utilizada pela party.
 
+## Atualizador Windows
+
+O build compila um updater WinForms independente e o inclui em `resources/updater/`. Na primeira abertura, o Party P2P o copia para `%APPDATA%\Party P2P\updater\PartyP2P.Updater.exe`. O updater usa elevação UAC, download HTTPS restrito às releases oficiais, validação PE/SHA-256 (quando o GitHub fornece o digest), staging, substituição atômica com backup e rollback.
+
+Na versão portátil, o alvo é `PORTABLE_EXECUTABLE_FILE` — o launcher real aberto pela pessoa — e não `process.execPath`, que aponta para a cópia extraída em `%TEMP%`. Falhas detalhadas ficam em `%APPDATA%\Party P2P\updater\updater.log`.
+
+Para validar isoladamente o mecanismo de troca:
+
+```powershell
+npm run build:updater
+Start-Process .\build\updater\PartyP2P.Updater.exe -ArgumentList --self-test -Wait
+```
+
 ## Compartilhar o trabalho
 
 As alterações estão na branch `codex/continuar-projeto`. Depois de revisar, envie a branch ao GitHub e abra uma pull request para o repositório original. `npm run dist` gera os pacotes Windows em `dist/`. O comando `npm run release` publica no GitHub; use apenas ao preparar uma release autorizada.
